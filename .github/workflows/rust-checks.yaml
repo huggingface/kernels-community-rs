@@ -1,0 +1,86 @@
+name: Rust checks
+
+# Cheap checks for every Rust kernel (a directory with build.toml and
+# Cargo.toml). They run on plain CPU runners: compiling the kernels needs the
+# cuda-oxide toolchain and runs in build.yaml instead.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-git-hashes.json"
+      - ".github/workflows/rust-checks.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/rust-git-hashes.json"
+      - ".github/workflows/rust-checks.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # rustfmt comes from the nixpkgs locked by the root flake, so its version
+  # only changes with flake.lock.
+  lint:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Check formatting
+        run: |
+          status=0
+          for manifest in */Cargo.toml; do
+            kernel=$(dirname "$manifest")
+            [ -f "$kernel/build.toml" ] || continue
+            edition=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["edition"])' "$manifest")
+            echo "::group::rustfmt $kernel (edition $edition)"
+            nix run --inputs-from . nixpkgs#rustfmt -- --check --edition "$edition" "$kernel/src/lib.rs" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+
+  # Nix fetches Cargo git dependencies by the hashes in rust-git-hashes.json.
+  # A stale file only fails deep inside the kernel build, so regenerate it with
+  # the kernel's own hash-rust and fail on any difference.
+  git-hashes:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: huggingface
+        env:
+          USER: runner
+
+      - name: Check rust-git-hashes.json
+        run: |
+          status=0
+          for lock in */Cargo.lock; do
+            kernel=$(dirname "$lock")
+            [ -f "$kernel/build.toml" ] || continue
+            echo "::group::hash-rust $kernel"
+            ( cd "$kernel" && nix run .#hash-rust ) || status=1
+            echo "::endgroup::"
+          done
+          if ! git diff --exit-code -- '*/rust-git-hashes.json'; then
+            echo "::error::rust-git-hashes.json is stale; run 'nix run .#hash-rust' in the kernel directory and commit the result."
+            status=1
+          fi
+          exit $status

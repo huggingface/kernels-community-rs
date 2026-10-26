@@ -1,0 +1,27 @@
+name: Check upstream copies
+
+# Files with a "Copied from <kernels-community URL>" header must stay identical
+# to that pinned upstream revision; see .github/scripts/check_upstream_copies.py.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  check:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare exact copies with kernels-community
+        run: python3 .github/scripts/check_upstream_copies.py

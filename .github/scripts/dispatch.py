@@ -1,0 +1,749 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/dispatch.py
+# Changes: adds HUB_ORG/STAGING_ORG and routes only cuda/cpu to build.yaml (no Windows, macOS or TPU).
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+# Configuration
+
+# Hub orgs: releases and PR builds target HUB_ORG, `build-and-stage` STAGING_ORG.
+HUB_ORG = "kernels-community-rs"
+STAGING_ORG = "kernels-staging"
+
+WORKFLOWS = {
+    "build": [
+        "build.yaml",
+    ],
+    "security": [
+        "security-audit.yml",
+    ],
+}
+
+KERNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# Workflow file -> its YAML `name:`; must match the context the build reports.
+WORKFLOW_DISPLAY_NAMES = {
+    "build.yaml": "Build",
+}
+
+# Rust kernels are only built on Linux, so every backend maps to build.yaml.
+BACKEND_TO_WORKFLOWS = {
+    "cuda": {"build.yaml"},
+    "cpu": {"build.yaml"},
+}
+
+WORKFLOW_TO_BACKENDS = {
+    workflow: {b for b, wfs in BACKEND_TO_WORKFLOWS.items() if workflow in wfs}
+    for workflow in WORKFLOWS["build"]
+}
+
+
+# Data types
+
+
+@dataclass
+class DispatchResult:
+    kernel_name: str
+    dispatched: list[tuple[str, str]] = field(default_factory=list)
+    failed: list[tuple[str, int]] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    security_dispatched: list[tuple[str, str]] = field(default_factory=list)
+    security_failed: list[tuple[str, int]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    dry_run_payloads: list[tuple[str, dict]] = field(default_factory=list)
+
+
+@dataclass
+class PlannedDispatch:
+    kind: str  # "build" or "security"
+    workflow: str
+    dispatch_key: str
+    body: dict
+    description: str
+    status_context: str | None = None  # build only
+
+
+@dataclass
+class DispatchPlan:
+    kernel_name: str
+    head_sha: str = ""
+    actions: list[PlannedDispatch] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+# Reading build.toml and selecting workflows
+
+
+def parse_kernel_arg(token: str) -> tuple[str | None, list[str] | None]:
+    name, bracket, rest = token.partition("[")
+    if not KERNEL_NAME_RE.match(name):
+        return None, None
+    if not bracket:
+        return name, None
+    if not rest.endswith("]"):
+        return None, None
+    backends = rest[:-1].split(",")
+    if not all(backends):  # reject empty components: "[]", "[cpu,]", "[,]"
+        return None, None
+    return name, backends
+
+
+def read_backends(kernel_name: str, ref: str = "") -> list[str] | None:
+    # Ported kernels keep build.toml in <kernel>/src, with flake.nix staying at
+    # <kernel>; every other kernel keeps the two side by side. Try the nested
+    # path first so a ported kernel resolves, then fall back to the flat one.
+    candidates = [f"{kernel_name}/src/build.toml", f"{kernel_name}/build.toml"]
+
+    # ref reads build.toml from that revision (the PR branch), not the working tree.
+    if ref:
+        raw = None
+        for candidate in candidates:
+            try:
+                raw = subprocess.run(
+                    ["git", "show", f"{ref}:{candidate}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+                break
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+        if raw is None:
+            return None
+        config = tomllib.loads(raw)
+    else:
+        build_toml = next((Path(c) for c in candidates if Path(c).exists()), None)
+        if build_toml is None:
+            return None
+        with open(build_toml, "rb") as f:
+            config = tomllib.load(f)
+    backends = config.get("general", {}).get("backends")
+    if backends is None:
+        backends = config.get("backends")
+    if isinstance(backends, list):
+        return backends
+    return None
+
+
+def select_workflows(
+    kernel_name: str, backends: list[str] | None, *, notes: list[str]
+) -> set[str]:
+    if backends is None:
+        notes.append(
+            f"Could not read backends for {kernel_name}, dispatching all workflows"
+        )
+        return set(WORKFLOWS["build"])
+
+    workflows = set()
+    for b in backends:
+        workflows.update(BACKEND_TO_WORKFLOWS.get(b, set()))
+
+    if not workflows:
+        notes.append(
+            f"No known backends found for {kernel_name}: {backends}, dispatching all workflows"
+        )
+        return set(WORKFLOWS["build"])
+
+    return workflows
+
+
+# Planning
+
+
+def _build_inputs(
+    kernel_name: str,
+    dispatch_key: str,
+    mode: str,
+    backends_csv: str,
+    repo_prefix: str,
+    *,
+    skip_build: bool,
+    pr_number: str,
+    head_sha: str,
+    target_branch: str,
+    upload: bool,
+    bot_comment_id: str,
+) -> dict:
+    inputs = {
+        "kernel_name": kernel_name,
+        "dispatch_key": dispatch_key,
+        "mode": mode,
+        "backends": backends_csv,
+        "repo_prefix": repo_prefix,
+    }
+    if skip_build:
+        inputs["skip_build"] = "true"
+    if pr_number:
+        inputs["pr_number"] = pr_number
+    if head_sha:
+        inputs["head_sha"] = head_sha
+    if target_branch:
+        inputs["target_branch"] = target_branch
+    if not upload:
+        inputs["upload"] = "false"
+    if upload and bot_comment_id:
+        inputs["bot_comment_id"] = bot_comment_id
+    return inputs
+
+
+def _plan_security_actions(
+    plan: DispatchPlan,
+    *,
+    ref: str,
+    pr_number: str,
+    head_sha: str,
+    dispatch_key_prefix: str,
+) -> None:
+    for workflow in WORKFLOWS["security"]:
+        dispatch_key = (
+            f"{dispatch_key_prefix}security-{workflow}-{uuid.uuid4().hex[:12]}"
+        )
+        body = {
+            "ref": ref,
+            "inputs": {
+                "pr_number": pr_number,
+                "dispatch_key": dispatch_key,
+                "head_sha": head_sha,
+            },
+        }
+        plan.actions.append(
+            PlannedDispatch(
+                kind="security",
+                workflow=workflow,
+                dispatch_key=dispatch_key,
+                body=body,
+                description=f"for PR #{pr_number} on ref `{ref}`",
+            )
+        )
+
+
+def _plan_build_actions(
+    plan: DispatchPlan,
+    kernel_name: str,
+    *,
+    ref: str,
+    mode: str,
+    repo_prefix: str,
+    dispatch_key_prefix: str,
+    skip_build: bool,
+    pr_number: str,
+    head_sha: str,
+    target_branch: str,
+    upload: bool,
+    bot_comment_id: str,
+    metadata_ref: str = "",
+    requested_backends: list[str] | None = None,
+) -> None:
+    backends = read_backends(kernel_name, metadata_ref)
+    if requested_backends is not None and backends is not None:
+        backends = [b for b in backends if b in requested_backends]
+        if not backends:
+            plan.notes.append(
+                f"None of the requested backends {requested_backends} are "
+                f"declared by {kernel_name}; skipping build"
+            )
+            plan.skipped = sorted(WORKFLOWS["build"])
+            return
+
+    workflows = select_workflows(kernel_name, backends, notes=plan.notes)
+    plan.skipped = sorted(set(WORKFLOWS["build"]) - workflows)
+    backends = backends or []
+
+    for workflow in sorted(workflows):
+        scoped = sorted(
+            b for b in backends if b in WORKFLOW_TO_BACKENDS.get(workflow, set())
+        )
+
+        dispatch_key = (
+            f"{dispatch_key_prefix}{kernel_name}-{workflow}-{uuid.uuid4().hex[:12]}"
+        )
+        status_context = (
+            f"{WORKFLOW_DISPLAY_NAMES.get(workflow, workflow)} / {kernel_name}"
+            if head_sha
+            else None
+        )
+        plan.actions.append(
+            PlannedDispatch(
+                kind="build",
+                workflow=workflow,
+                dispatch_key=dispatch_key,
+                body={
+                    "ref": ref,
+                    "inputs": _build_inputs(
+                        kernel_name,
+                        dispatch_key,
+                        mode,
+                        ",".join(scoped),
+                        repo_prefix,
+                        skip_build=skip_build,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        target_branch=target_branch,
+                        upload=upload,
+                        bot_comment_id=bot_comment_id,
+                    ),
+                },
+                description=f"for kernel `{kernel_name}` on ref `{ref}`",
+                status_context=status_context,
+            )
+        )
+
+
+def plan_dispatch(
+    kernel_name: str = "",
+    *,
+    ref: str = "main",
+    mode: str = "release",
+    repo_prefix: str = HUB_ORG,
+    dispatch_key_prefix: str = "",
+    skip_build: bool = False,
+    pr_number: str = "",
+    head_sha: str = "",
+    target_branch: str = "",
+    upload: bool = True,
+    bot_comment_id: str = "",
+    run_security: bool = False,
+    security_only: bool = False,
+    metadata_ref: str = "",
+    requested_backends: list[str] | None = None,
+) -> DispatchPlan:
+    want_security = run_security or security_only
+    plan = DispatchPlan(kernel_name=kernel_name, head_sha=head_sha)
+
+    if not security_only:
+        _plan_build_actions(
+            plan,
+            kernel_name,
+            ref=ref,
+            mode=mode,
+            repo_prefix=repo_prefix,
+            dispatch_key_prefix=dispatch_key_prefix,
+            metadata_ref=metadata_ref,
+            skip_build=skip_build,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            target_branch=target_branch,
+            upload=upload,
+            bot_comment_id=bot_comment_id,
+            requested_backends=requested_backends,
+        )
+
+    if want_security:
+        if pr_number:
+            _plan_security_actions(
+                plan,
+                ref=ref,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                dispatch_key_prefix=dispatch_key_prefix,
+            )
+        elif security_only:
+            plan.notes.append(
+                "security_only set but no pr_number provided; nothing to do."
+            )
+        else:
+            plan.notes.append(
+                "run_security set but no pr_number provided; skipping security audit."
+            )
+
+    return plan
+
+
+# Execution (performs the GitHub API I/O)
+
+
+def github_api_request(
+    url: str, token: str, method: str = "GET", data: dict | None = None
+):
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+
+    req = urllib.request.Request(
+        url=url,
+        data=body,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        return resp.status, resp.read().decode("utf-8")
+
+
+def _blank_result(plan: DispatchPlan) -> DispatchResult:
+    return DispatchResult(
+        kernel_name=plan.kernel_name,
+        skipped=list(plan.skipped),
+        notes=list(plan.notes),
+    )
+
+
+def _set_pending_status(
+    action: PlannedDispatch,
+    result: DispatchResult,
+    *,
+    token: str,
+    api_base: str,
+    head_sha: str,
+) -> None:
+    if not (action.status_context and head_sha):
+        return
+    status_url = f"{api_base}/statuses/{head_sha}"
+    try:
+        github_api_request(
+            status_url,
+            token,
+            method="POST",
+            data={
+                "state": "pending",
+                "description": "Build queued",
+                "context": action.status_context,
+            },
+        )
+    except urllib.error.HTTPError as e:
+        # Non-fatal: the build was dispatched, status is best-effort.
+        result.notes.append(
+            f"Warning: failed to set pending status for {action.status_context}: {e}"
+        )
+
+
+def execute_plan(plan: DispatchPlan, *, token: str, repo: str) -> DispatchResult:
+    result = _blank_result(plan)
+    api_base = f"https://api.github.com/repos/{repo}"
+    for action in plan.actions:
+        url = f"{api_base}/actions/workflows/{action.workflow}/dispatches"
+        try:
+            result.notes.append(f"Dispatching {action.workflow} {action.description}")
+            github_api_request(url, token, method="POST", data=action.body)
+            if action.kind == "security":
+                result.security_dispatched.append(
+                    (action.workflow, action.dispatch_key)
+                )
+            else:
+                result.dispatched.append((action.workflow, action.dispatch_key))
+                _set_pending_status(
+                    action,
+                    result,
+                    token=token,
+                    api_base=api_base,
+                    head_sha=plan.head_sha,
+                )
+        except urllib.error.HTTPError as e:
+            err_text = e.read().decode("utf-8", errors="replace")
+            result.notes.append(
+                f"Failed to dispatch {action.workflow} (HTTP {e.code}): {err_text}"
+            )
+            if action.kind == "security":
+                result.security_failed.append((action.workflow, e.code))
+            else:
+                result.failed.append((action.workflow, e.code))
+    return result
+
+
+def _result_from_plan(plan: DispatchPlan) -> DispatchResult:
+    result = _blank_result(plan)
+    for action in plan.actions:
+        if action.kind == "security":
+            result.security_dispatched.append((action.workflow, action.dispatch_key))
+        else:
+            result.dispatched.append((action.workflow, action.dispatch_key))
+        result.dry_run_payloads.append((action.workflow, action.body))
+    return result
+
+
+# Orchestration
+
+
+def dispatch(
+    kernel_name: str = "",
+    *,
+    token: str,
+    repo: str,
+    ref: str = "main",
+    mode: str = "release",
+    repo_prefix: str = HUB_ORG,
+    dispatch_key_prefix: str = "",
+    dry_run: bool = False,
+    skip_build: bool = False,
+    pr_number: str = "",
+    head_sha: str = "",
+    target_branch: str = "",
+    upload: bool = True,
+    bot_comment_id: str = "",
+    run_security: bool = False,
+    security_only: bool = False,
+    metadata_ref: str = "",
+    requested_backends: list[str] | None = None,
+) -> DispatchResult:
+    if not security_only and (not kernel_name or not KERNEL_NAME_RE.match(kernel_name)):
+        result = DispatchResult(kernel_name=kernel_name)
+        result.notes.append(f"Invalid kernel name: {kernel_name!r}")
+        for wf in WORKFLOWS["build"]:
+            result.failed.append((wf, 0))
+        return result
+
+    plan = plan_dispatch(
+        kernel_name,
+        ref=ref,
+        mode=mode,
+        repo_prefix=repo_prefix,
+        dispatch_key_prefix=dispatch_key_prefix,
+        skip_build=skip_build,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        target_branch=target_branch,
+        upload=upload,
+        bot_comment_id=bot_comment_id,
+        run_security=run_security,
+        security_only=security_only,
+        metadata_ref=metadata_ref,
+        requested_backends=requested_backends,
+    )
+    if dry_run:
+        return _result_from_plan(plan)
+    return execute_plan(plan, token=token, repo=repo)
+
+
+# Command-line interface
+
+
+def get_token() -> str | None:
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        return token
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() or None
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+
+def get_repo() -> str | None:
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if repo:
+        return repo
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        url = result.stdout.strip()
+        match = re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
+        if match:
+            return match.group(1)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
+    return None
+
+
+def format_dry_run_payloads(result: DispatchResult) -> str:
+    lines = []
+    for workflow, body in result.dry_run_payloads:
+        lines.append(f"\n[dry-run] {workflow}:")
+        lines.append(json.dumps(body, indent=2))
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Dispatch release workflows for a kernel"
+    )
+    parser.add_argument(
+        "kernel_name",
+        nargs="?",
+        default="",
+        help=(
+            "Kernel directory name, optionally scoped as "
+            "'kernel[backend1,backend2]' (not required with --security-only)"
+        ),
+    )
+    parser.add_argument(
+        "--ref", default="main", help="Git ref to dispatch on (default: main)"
+    )
+    parser.add_argument(
+        "--mode",
+        default="release",
+        choices=["pr", "stage", "release"],
+        help="Build mode: pr (CI only), stage (build + upload + test), or release (build + upload) (default: release)",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="GitHub repo in owner/repo format (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip build and upload steps (for testing workflow plumbing)",
+    )
+    parser.add_argument(
+        "--pr-number",
+        default="",
+        help="PR number to checkout before building",
+    )
+    parser.add_argument(
+        "--head-sha",
+        default="",
+        help="PR head SHA for commit status reporting",
+    )
+    parser.add_argument(
+        "--bot-comment-id",
+        default="",
+        help="Issue comment ID to update with Hub upload links",
+    )
+    parser.add_argument(
+        "--target-branch",
+        default="",
+        help="Target branch for upload",
+    )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Build only, do not upload",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the dispatch payloads without actually dispatching",
+    )
+    parser.add_argument(
+        "--repo-prefix",
+        default=HUB_ORG,
+        help=f"Hub org prefix for uploads (default: {HUB_ORG})",
+    )
+    parser.add_argument(
+        "--security",
+        action="store_true",
+        help="Also dispatch the security-audit workflow for the PR (requires --pr-number)",
+    )
+    parser.add_argument(
+        "--security-only",
+        action="store_true",
+        help="Only dispatch the security-audit workflow, skip all builds (requires --pr-number)",
+    )
+    parser.add_argument(
+        "--dispatch-key-prefix",
+        default="",
+        help="Prefix for dispatch keys (the bot uses 'pr<N>-')",
+    )
+    args = parser.parse_args()
+
+    if args.security_only:
+        if not args.pr_number:
+            print("Error: --security-only requires --pr-number.", file=sys.stderr)
+            return 1
+
+    if not args.security_only and not args.kernel_name:
+        print(
+            "Error: kernel_name is required (unless using --security-only).",
+            file=sys.stderr,
+        )
+        return 1
+
+    kernel_name = args.kernel_name
+    requested_backends = None
+    if kernel_name:
+        kernel_name, requested_backends = parse_kernel_arg(kernel_name)
+        if kernel_name is None:
+            print(
+                f"Error: invalid kernel argument {args.kernel_name!r} "
+                "(expected 'kernel' or 'kernel[backend1,backend2]').",
+                file=sys.stderr,
+            )
+            return 1
+
+    common = dict(
+        mode=args.mode,
+        repo_prefix=args.repo_prefix,
+        dry_run=args.dry_run,
+        skip_build=args.skip_build,
+        pr_number=args.pr_number,
+        head_sha=args.head_sha,
+        bot_comment_id=args.bot_comment_id,
+        target_branch=args.target_branch,
+        upload=not args.no_upload,
+        run_security=args.security,
+        security_only=args.security_only,
+        dispatch_key_prefix=args.dispatch_key_prefix,
+        requested_backends=requested_backends,
+    )
+
+    if args.dry_run:
+        result = dispatch(
+            kernel_name or "",
+            token="",
+            repo=args.repo or "",
+            ref=args.ref,
+            **common,
+        )
+    else:
+        token = get_token()
+        if not token:
+            print(
+                "Error: No GitHub token found. Set GITHUB_TOKEN or run `gh auth login`.",
+                file=sys.stderr,
+            )
+            return 1
+
+        repo = args.repo or get_repo()
+        if not repo:
+            print(
+                "Error: Cannot determine repository. Set GITHUB_REPOSITORY or use --repo.",
+                file=sys.stderr,
+            )
+            return 1
+
+        result = dispatch(
+            kernel_name or "",
+            token=token,
+            repo=repo,
+            ref=args.ref,
+            **common,
+        )
+
+    # Diagnostics to stderr; results (payloads + summary) to stdout.
+    for note in result.notes:
+        print(note, file=sys.stderr)
+    if args.dry_run and result.dry_run_payloads:
+        print(format_dry_run_payloads(result))
+
+    def section(title: str, lines: list[str]) -> None:
+        if lines:
+            print(f"\n{title} ({len(lines)}):")
+            for line in lines:
+                print(f"  - {line}")
+
+    section("Dispatched", [f"{wf} (key: {dk})" for wf, dk in result.dispatched])
+    section("Security", [f"{wf} (key: {dk})" for wf, dk in result.security_dispatched])
+    section("Security failed", [f"{wf} (HTTP {c})" for wf, c in result.security_failed])
+    section("Skipped", result.skipped)
+    section("Failed", [f"{wf} (HTTP {c})" for wf, c in result.failed])
+
+    return 1 if result.failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,51 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/workflows/check-public-api.yaml
+# Changes: fetches check_public_api.py from kernels-community at a pinned commit instead of vendoring it.
+
+name: Check Public API
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - ".github/**"
+      - "*.json"
+      - "*.nix"
+      - "*.lock"
+      - ".gitignore"
+      - ".gitmodules"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+
+permissions: {}
+
+jobs:
+  check-public-api:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        run: pip install uv
+
+      # The checker lives in kernels-community; fetch it at a pinned commit
+      # instead of vendoring a copy. It reads kernels from the working
+      # directory, so it runs against this repository unchanged.
+      - name: Fetch public API checker
+        env:
+          CHECKER_SHA: d0dae8244ce204ddd846db06957ba14c1846e0dd
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/check_public_api.py" \
+            "https://raw.githubusercontent.com/huggingface/kernels-community/$CHECKER_SHA/scripts/check_public_api.py"
+
+      - name: Check public API
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          uv run --script "$RUNNER_TEMP/check_public_api.py" --base-ref "$BASE_SHA"
