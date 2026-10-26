@@ -1,3 +1,5 @@
+# Copied from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/test_format_hub_upload_comment.py
+
 import json
 
 import pytest

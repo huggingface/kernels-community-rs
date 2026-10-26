@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/kernel_maintainers.py
+# Changes: User-Agent names kernels-community-rs.
 
 import argparse
 import json

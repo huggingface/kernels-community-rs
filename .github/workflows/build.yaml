@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/workflows/build.yaml
+# Changes: defaults to the kernels-community-rs org, builds on x86_64-linux only and drops the TPU steps.
+
 name: Build
 run-name: >-
   Build / ${{ inputs.kernel_name || '' }} / mode=${{ inputs.mode || 'release' }} / request=${{ inputs.dispatch_key || '' }}

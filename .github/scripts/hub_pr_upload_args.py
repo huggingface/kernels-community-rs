@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/hub_pr_upload_args.py
+# Changes: takes the community org from dispatch.HUB_ORG.
+
 # Input:
 #   <repo-id|upload-args> <kernel> <repo-prefix>
 #

@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/pr_comment_kernel_bot.py
+# Changes: uses HUB_ORG/STAGING_ORG from dispatch.py instead of hard-coded org names.
+
 from dataclasses import dataclass, field
 import json
 import os

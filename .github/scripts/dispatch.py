@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/dispatch.py
+# Changes: adds HUB_ORG/STAGING_ORG and routes only cuda/cpu to build.yaml (no Windows, macOS or TPU).
+
 import argparse
 import json
 import os

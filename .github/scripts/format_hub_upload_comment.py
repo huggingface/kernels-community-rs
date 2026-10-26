@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/format_hub_upload_comment.py
+# Changes: usage examples use the kernels-community-rs org.
+
 # Input:
 #   [--base <comment-body>] <kernel> <repo-prefix>
 #   <upload-json-or-path-or-directory>...

@@ -1,3 +1,6 @@
+<!-- Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/pull_request_template.md -->
+<!-- Changes: describes this repository as the home for Rust kernels. -->
+
 ## Important: Read before submitting
 
 > **New contributors:** Please open or comment on an issue **before** submitting a

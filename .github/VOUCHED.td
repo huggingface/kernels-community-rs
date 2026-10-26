@@ -1,3 +1,5 @@
+# Copied from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/VOUCHED.td
+
 # Vouched contributors for kernels-community
 # One GitHub handle per line, sorted alphabetically.
 # Denounce with a leading hyphen: -username reason

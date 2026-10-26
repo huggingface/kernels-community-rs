@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/flake.nix
+# Changes: renames the flake description and dev shell to kernels-community-rs.
+
 {
   description = "kernels-community-rs tooling";
 

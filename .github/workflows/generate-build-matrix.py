@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/workflows/generate-build-matrix.py
+# Changes: x86_64-linux only, with cuda and cpu as the only valid backends.
+
 """Generate a GitHub Actions build matrix from the x86_64-linux backend list.
 
 Usage:

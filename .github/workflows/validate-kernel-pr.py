@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copied from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/workflows/validate-kernel-pr.py
+
 """
 Validate kernel build request and directory structure.
 """

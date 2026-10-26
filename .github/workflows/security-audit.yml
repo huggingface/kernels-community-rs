@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/workflows/security-audit.yml
+# Changes: the audit prompt describes the Rust kernel layout and the kernels-community-rs org.
+
 name: Security Audit
 
 run-name: >-

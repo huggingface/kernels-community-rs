@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/test_pr_comment_kernel_bot.py
+# Changes: uses Rust kernel names and backends; dry-run tests run against a throwaway kernel.
+
 import os
 from pathlib import Path
 import subprocess

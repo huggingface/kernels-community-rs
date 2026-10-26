@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copied from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/check_kernel_test_versions.py
+
 """Check that kernel tests load the version declared in build.toml."""
 
 from __future__ import annotations

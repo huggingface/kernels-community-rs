@@ -1,3 +1,6 @@
+# Adapted from https://github.com/huggingface/kernels-community/blob/18153cd077b6541e9c4cb98ad9678db4e1253d1f/.github/scripts/test_hub_pr_upload_args.py
+# Changes: uses the kernels-community-rs org and allows a repository with no kernels yet.
+
 import os
 import sys
 
