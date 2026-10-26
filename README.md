@@ -21,9 +21,6 @@ Python bindings go through tvm-ffi.
 
 ## Development
 
-Before submitting a kernel PR, please make sure to read the
-[Contributing Guidelines](./CONTRIBUTING.md).
-
 Builds are started by commenting on a PR (members and collaborators only):
 
 ```
