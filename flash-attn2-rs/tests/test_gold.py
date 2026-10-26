@@ -6,9 +6,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 flash_attn2_rs = kernels.get_kernel("kernels-community-rs/flash-attn2-rs", version=1)
-# The staging build supports generator-backed dropout on Torch 2.14. Switch to
-# `kernels-community/flash-attn2` once that build is released.
-flash_attn2 = kernels.get_kernel("kernels-staging/flash-attn2", revision="pr-1226")
+flash_attn2 = kernels.get_kernel("kernels-community/flash-attn2", version=4)
 
 # Generator-backed dropout needs `torch.Generator.philox_state` (Torch 2.14).
 requires_philox_state = pytest.mark.skipif(
