@@ -1,12 +1,20 @@
 from ctypes import c_float
 from functools import cache
-from tvm_ffi import get_global_func
 import math
 import operator
 
 from ._ops import ops
 
-_array_getitem = get_global_func("ffi.ArrayGetItem")
+
+def _torch_tensors(values):
+    # tvm-ffi converts returned tensors to torch, but not tensors in a returned Array.
+    import torch
+
+    return [torch.from_dlpack(value) for value in values]
+
+
+def fwd_explicit(*args):
+    return _torch_tensors(ops.fwd(*args))
 
 
 def reserve_rng_state(q, gen=None):
@@ -836,7 +844,7 @@ def fwd(
             with torch.cuda.device(q.device):
                 values = launch()
         if return_softmax:
-            output, lse, probabilities = values
+            output, lse, probabilities = _torch_tensors(values)
         else:
             lse = values
             probabilities = torch.empty(0, device=q.device, dtype=q.dtype)
@@ -994,13 +1002,9 @@ def bwd(
     )
     if deterministic:
         grad_q = ops.bwd_dq(*args)
-        values = ops.bwd_dkv(*args)
-        grad_k, grad_v = _array_getitem(values, 0), _array_getitem(values, 1)
+        grad_k, grad_v = _torch_tensors(ops.bwd_dkv(*args))
     else:
-        values = ops.bwd_all(*args)
-        grad_q = _array_getitem(values, 0)
-        grad_k = _array_getitem(values, 1)
-        grad_v = _array_getitem(values, 2)
+        grad_q, grad_k, grad_v = _torch_tensors(ops.bwd_all(*args))
     gradients = _finish_gradients((grad_q, grad_k, grad_v), (dq, dk, dv), (q, k, v))
     return [*gradients, delta]
 
@@ -1216,9 +1220,7 @@ def varlen_fwd(
         *([None, seed, offset, intragraph, bool(captured)]
           if fused_rng else [block_table] if paged else []),
     )
-    output = _array_getitem(values, 0)
-    lse = _array_getitem(values, 1)
-    probabilities = _array_getitem(values, 2)
+    output, lse, probabilities = _torch_tensors(values)
     if output.ndim == 4:  # Preserve compatibility with rank-four native results.
         output = output.squeeze(0)
     swap_groups = (
@@ -1464,10 +1466,9 @@ def varlen_bwd(
         max_k,
         bool(zero_tensors),
     )
-    gradients = _finish_gradients(
-        values[:3], (dq, dk, dv), (q, k, v)
-    )
-    return [*gradients, values[3]]
+    grad_q, grad_k, grad_v, softmax_d = _torch_tensors(values)
+    gradients = _finish_gradients((grad_q, grad_k, grad_v), (dq, dk, dv), (q, k, v))
+    return [*gradients, softmax_d]
 
 
 def fwd_kvcache(
@@ -1630,7 +1631,7 @@ def fwd_kvcache(
     if grouped:
         attention_sq = h // kp.shape[2]
         attention_q = qp.reshape(b, kp.shape[2], attention_sq, padded_d).transpose(1, 2)
-    output, lse, _ = ops.varlen_fwd_explicit(
+    values = ops.varlen_fwd_explicit(
         attention_q,
         kp,
         vp,
@@ -1656,6 +1657,7 @@ def fwd_kvcache(
         splits,
         grouped,
     )
+    output, lse, _ = _torch_tensors(values)
     if grouped:
         output = output.reshape(b, 1, h, padded_d)
         lse = lse.reshape(b, h, 1)

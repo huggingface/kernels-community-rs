@@ -1,6 +1,7 @@
 from ._ops import ops
 
 from .flash_attn_interface import (
+    fwd_explicit,
     reserve_rng_state,
     fwd_kvcache,
     flash_attn_with_kvcache,
@@ -15,8 +16,6 @@ from .flash_attn_interface import (
     flash_attn_varlen_qkvpacked_func,
     flash_attn_varlen_kvpacked_func,
 )
-
-fwd_explicit = ops.fwd
 
 __all__ = [
     "fwd_kvcache",
