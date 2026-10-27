@@ -1,0 +1,20 @@
+[general]
+name = "activation-rs"
+version = 1
+edition = 6
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community-rs/activation-rs"
+
+# No C++ binding sources: the `__tvm_ffi_*` exports come from the Rust crate.
+[tvm-ffi]
+
+# Like the upstream CUDA kernel, no `cuda-capabilities`: build for the
+# kernel-builder defaults.
+[kernel.activation_rs]
+language = "rust-cuda"
+cargo-manifest = "Cargo.toml"
+depends = []
+src = ["Cargo.toml", "Cargo.lock", "src"]
