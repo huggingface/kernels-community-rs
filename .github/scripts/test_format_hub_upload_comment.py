@@ -23,8 +23,8 @@ def test_upload_lines_discovers_json_in_directory(tmp_path, nested):
         )
     )
 
-    assert upload_lines("example", "kernels-staging", [str(tmp_path / "hub-uploads")]) == [
-        "- Hub repo: https://huggingface.co/kernels/kernels-staging/example",
+    assert upload_lines("example", "kernels-staging-rs", [str(tmp_path / "hub-uploads")]) == [
+        "- Hub repo: https://huggingface.co/kernels/kernels-staging-rs/example",
         "- Hub pull request: https://huggingface.co/kernels/example/discussions/1",
     ]
 

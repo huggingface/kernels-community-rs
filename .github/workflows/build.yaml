@@ -41,7 +41,7 @@ on:
         type: boolean
         default: true
       repo_prefix:
-        description: "Hub org prefix for uploads (e.g. kernels-community-rs, kernels-staging)"
+        description: "Hub org prefix for uploads (e.g. kernels-community-rs, kernels-staging-rs)"
         required: false
         type: string
         default: "kernels-community-rs"
@@ -456,6 +456,7 @@ jobs:
       actions: read
       contents: read
       issues: write
+      pull-requests: write
       statuses: write
     env:
       REPORT_HUB_UPLOAD: ${{ needs.build-kernel.result == 'success' && inputs.bot_comment_id != '' && inputs.mode != 'pr' && inputs.upload != false }}
