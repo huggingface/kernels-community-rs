@@ -19,7 +19,7 @@ from pathlib import Path
 
 # Hub orgs: releases and PR builds target HUB_ORG, `build-and-stage` STAGING_ORG.
 HUB_ORG = "kernels-community-rs"
-STAGING_ORG = "kernels-staging"
+STAGING_ORG = "kernels-staging-rs"
 
 WORKFLOWS = {
     "build": [

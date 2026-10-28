@@ -12,7 +12,7 @@ sys.path.insert(0, SCRIPT_DIR)
 import hub_pr_upload_args as hub  # noqa: E402
 
 COMMUNITY = "kernels-community-rs"
-STAGING = "kernels-staging"
+STAGING = "kernels-staging-rs"
 
 COMMUNITY_TOML = b'[general.hub]\nrepo-id = "kernels-community-rs/mykernel"\n'
 EXTERNAL_TOML = b'[general.hub]\nrepo-id = "MiniMaxAI/msa"\n'
@@ -36,7 +36,7 @@ def test_kernel_resolved_from_working_directory(tmp_path, monkeypatch):
 def test_missing_build_toml_falls_back_to_prefix(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert hub.external_repo_id("newkernel", COMMUNITY) == ""
-    assert hub.repo_id("newkernel", STAGING) == "kernels-staging/newkernel"
+    assert hub.repo_id("newkernel", STAGING) == "kernels-staging-rs/newkernel"
 
 
 def test_community_repo_id_is_not_external(tmp_path, monkeypatch):
@@ -77,8 +77,8 @@ def test_staging_never_targets_the_vendor_repo(tmp_path, monkeypatch):
     write_kernel(tmp_path, "sgl-flash-attn3", b'[general.hub]\nrepo-id = "sgl-project/sgl-flash-attn3"\n')
     monkeypatch.chdir(tmp_path)
     assert hub.external_repo_id("sgl-flash-attn3", STAGING) == ""
-    assert hub.repo_id("sgl-flash-attn3", STAGING) == "kernels-staging/sgl-flash-attn3"
-    assert hub.upload_args("sgl-flash-attn3", STAGING) == "--repo-id kernels-staging/sgl-flash-attn3"
+    assert hub.repo_id("sgl-flash-attn3", STAGING) == "kernels-staging-rs/sgl-flash-attn3"
+    assert hub.upload_args("sgl-flash-attn3", STAGING) == "--repo-id kernels-staging-rs/sgl-flash-attn3"
 
 
 # Invariants over every real kernel: assert properties, not exact per-kernel output.

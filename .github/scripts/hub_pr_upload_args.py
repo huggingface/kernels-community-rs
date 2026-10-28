@@ -14,7 +14,7 @@
 # external repo-id.
 #
 # Only the community org defers to build.toml's repo-id. Every other prefix
-# (kernels-staging) uploads into its own org whatever build.toml declares: a
+# (kernels-staging-rs) uploads into its own org whatever build.toml declares: a
 # staging build must never open a pull request against the vendor repo it
 # mirrors, and the CI token has no write access there anyway.
 #

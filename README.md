@@ -26,6 +26,6 @@ Builds are started by commenting on a PR (members and collaborators only):
 
 ```
 /kernel-bot build <kernel>            # build + GPU tests, no upload
-/kernel-bot build-and-stage <kernel>  # build, upload to kernels-staging, GPU tests
+/kernel-bot build-and-stage <kernel>  # build, upload to kernels-staging-rs, GPU tests
 /kernel-bot merge-and-upload <kernel> # merge the PR and release to kernels-community-rs
 ```
