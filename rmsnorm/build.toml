@@ -1,0 +1,17 @@
+[general]
+name = "rmsnorm"
+version = 1
+edition = 6
+license = "BSD-2-Clause"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community-rs/rmsnorm"
+
+[tvm-ffi]
+
+[kernel.rmsnorm]
+language = "rust-cuda"
+cargo-manifest = "Cargo.toml"
+depends = []
+src = ["Cargo.toml", "Cargo.lock", "src"]
