@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: BSD-2-Clause
+
+[package]
+name = "rmsnorm"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+publish = false
+
+[lib]
+name = "rmsnorm"
+
+[workspace]
+
+# Kernels and host code live in this crate. kernel-builder compiles it with
+# the cuda-oxide codegen backend and links the kernels as SASS.
+[dependencies]
+cuda-core = { git = "https://github.com/drbh/cuda-oxide.git", rev = "d9d4e379e9a80d1ce7c681d88a086aacec95ba23" }
+cuda-device = { git = "https://github.com/drbh/cuda-oxide.git", rev = "d9d4e379e9a80d1ce7c681d88a086aacec95ba23" }
+cuda-host = { git = "https://github.com/drbh/cuda-oxide.git", rev = "d9d4e379e9a80d1ce7c681d88a086aacec95ba23" }
+half = "2"
+kernels-cuda = { git = "https://github.com/huggingface/kernels.git", rev = "ae983e7ce660d4ed3a1142d6b9a540b7576be47d" }
+tvm-ffi = "=0.1.14-post1"
+
+# Checked-in bindings: the build needs no CUDA headers or libclang.
+[patch."https://github.com/drbh/cuda-oxide.git"]
+cuda-bindings = { git = "https://github.com/drbh/cuda-bindings-prebuilt.git", rev = "f129e807d9a8ea32e7572369e91689c00c52570f" }
+
+[lints.rust]
+# kernel-builder sets `cuda_arch` for every capability it compiles.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cuda_arch, values(any()))'] }

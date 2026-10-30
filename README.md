@@ -19,6 +19,7 @@ Python bindings go through tvm-ffi.
 | Kernel | Backends | Hub |
 | --- | --- | --- |
 | [activation-rs](./activation-rs) | cuda | [kernels-community-rs/activation-rs](https://huggingface.co/kernels-community-rs/activation-rs) |
+| [rmsnorm](./rmsnorm) | cuda | [kernels-community-rs/rmsnorm](https://huggingface.co/kernels-community-rs/rmsnorm) |
 
 ## Development
 
