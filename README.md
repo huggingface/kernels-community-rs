@@ -20,6 +20,7 @@ Python bindings go through tvm-ffi.
 | --- | --- | --- |
 | [activation-rs](./activation-rs) | cuda | [kernels-community-rs/activation-rs](https://huggingface.co/kernels-community-rs/activation-rs) |
 | [rmsnorm](./rmsnorm) | cuda | [kernels-community-rs/rmsnorm](https://huggingface.co/kernels-community-rs/rmsnorm) |
+| [flash-attn2-rs](./flash-attn2-rs) | cuda | [kernels-community-rs/flash-attn2-rs](https://huggingface.co/kernels-community-rs/flash-attn2-rs) |
 
 ## Development
 
