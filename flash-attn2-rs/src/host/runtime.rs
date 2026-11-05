@@ -29,17 +29,8 @@ pub(super) struct Runtime {
     pub(super) bwd_dq_fns: HashMap<(i64, bool), CudaFunction>,
     pub(super) bwd_dq_swizzled_fns: HashMap<(bool, u8), CudaFunction>,
     pub(super) bwd_dq_split_fns: HashMap<(bool, u32), CudaFunction>,
-    pub(super) bwd_packed_dq_merge_fns: HashMap<(bool, u32), CudaFunction>,
-    pub(super) bwd_dq_merge_fns: HashMap<(bool, u8), CudaFunction>,
+    pub(super) bwd_dq_merge_fns: HashMap<bool, CudaFunction>,
     pub(super) bwd_dkv_both_fns: HashMap<(bool, bool, bool, bool), CudaFunction>,
-    pub(super) bwd_dense128_fns: HashMap<(bool, u8), CudaFunction>,
-    pub(super) bwd_fused_fns: HashMap<(bool, bool, bool, u8), CudaFunction>,
-    pub(super) bwd_fused_wide_pipeline_fns: HashMap<bool, CudaFunction>,
-    pub(super) bwd_causal_query_fns: HashMap<bool, CudaFunction>,
-    pub(super) bwd_causal_permuted_fns: HashMap<bool, CudaFunction>,
-    pub(super) bwd_fused_pipeline_fns: HashMap<(bool, bool), CudaFunction>,
-    pub(super) bwd_fused_d32_fns: HashMap<(bool, bool, bool, u8), CudaFunction>,
-    pub(super) bwd_fused_d64_fns: HashMap<(bool, bool, bool, u8), CudaFunction>,
     /// Head-dimension-generic fused backward, keyed by (D, bf16, partial, dropout, mode).
     pub(super) bwd_generic_fns: HashMap<(i64, bool, bool, bool, u8), CudaFunction>,
     /// Unpermutes and converts the generic kernel's dQ accumulator, keyed by (D, bf16).
@@ -51,7 +42,6 @@ pub(super) struct Runtime {
     pub(super) varlen_generic_dq_fns: HashMap<(i64, bool), CudaFunction>,
     pub(super) bwd_dkv_fns: HashMap<(i64, bool), CudaFunction>,
     pub(super) bwd_dkv_specialized_fns: HashMap<(bool, bool, u8), CudaFunction>,
-    pub(super) bwd_grad_merge_fns: HashMap<bool, CudaFunction>,
     pub(super) bwd_dkv_merge_fns: HashMap<bool, CudaFunction>,
     pub(super) cached_wide_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) cached_fns: HashMap<(i64, bool, bool), CudaFunction>,
@@ -62,8 +52,6 @@ pub(super) struct Runtime {
     pub(super) varlen_rng_fns: HashMap<bool, CudaFunction>,
     pub(super) varlen_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) varlen_dq_split_fns: HashMap<(i64, bool), CudaFunction>,
-    pub(super) varlen_fused_query_fns: HashMap<(bool, bool, bool), CudaFunction>,
-    pub(super) varlen_fused_fns: HashMap<(bool, bool, bool), CudaFunction>,
     pub(super) varlen_dkv_combined_fns: HashMap<bool, CudaFunction>,
     pub(super) varlen_bwd_causal_fns: HashMap<(bool, bool), CudaFunction>,
     pub(super) varlen_bwd_partial_fns: HashMap<(i64, bool), CudaFunction>,
@@ -433,17 +421,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
         }
     }
     let mut bwd_dq_split_fns = HashMap::new();
-    let mut bwd_packed_dq_merge_fns = HashMap::new();
-    for bf16 in [false, true] {
-        for (rows, suffix) in [(16u32, "wide"), (32, "causal"), (64, "d64")] {
-            let name = format!(
-                "backward_packed_dq_merge_{}_permuted_{}",
-                if bf16 { "bf16" } else { "f16" },
-                suffix
-            );
-            bwd_packed_dq_merge_fns.insert((bf16, rows), load_flash(&name, rows * 128)?);
-        }
-    }
     let mut bwd_dq_merge_fns = HashMap::new();
     for bf16 in [false, true] {
         for splits in [2, 4, 8] {
@@ -453,36 +430,8 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
             );
             bwd_dq_split_fns.insert((bf16, splits), load_flash(&name, 52224)?);
         }
-        for permuted in [0u8, 1, 2, 3, 4] {
-            let name = format!(
-                "backward_dq_merge_{}{}",
-                if bf16 { "bf16" } else { "f16" },
-                match permuted {
-                    1 => "_permuted",
-                    2 => "_permuted_d64",
-                    3 => "_permuted_wide",
-                    4 => "_permuted_causal",
-                    _ => "",
-                }
-            );
-            bwd_dq_merge_fns.insert(
-                (bf16, permuted),
-                load_flash(
-                    &name,
-                    if permuted == 1 {
-                        16384
-                    } else if permuted == 4 {
-                        4096
-                    } else if permuted == 3 {
-                        2048
-                    } else if permuted == 2 {
-                        8192
-                    } else {
-                        0
-                    },
-                )?,
-            );
-        }
+        let name = format!("backward_dq_merge_{}", if bf16 { "bf16" } else { "f16" });
+        bwd_dq_merge_fns.insert(bf16, load_flash(&name, 0)?);
     }
     let mut bwd_dq_swizzled_fns = HashMap::new();
     for bf16 in [false, true] {
@@ -511,44 +460,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
             bwd_dkv_fns.insert(
                 (bucket, bf16),
                 load_flash(&name, (128 * (bucket / 2 + 4) * 4) as u32)?,
-            );
-        }
-    }
-    let mut bwd_fused_wide_pipeline_fns = HashMap::new();
-    for bf16 in [false, true] {
-        let name = format!(
-            "fused_backward_pipeline_wide_d64_{}",
-            if bf16 { "bf16" } else { "f16" }
-        );
-        bwd_fused_wide_pipeline_fns.insert(bf16, load_flash(&name, 90112)?);
-    }
-    let mut bwd_causal_query_fns = HashMap::new();
-    for bf16 in [false, true] {
-        let name = format!(
-            "fused_backward_pipeline_d64_{}_causal_query",
-            if bf16 { "bf16" } else { "f16" }
-        );
-        bwd_causal_query_fns.insert(bf16, load_flash(&name, 98304)?);
-    }
-    let mut bwd_causal_permuted_fns = HashMap::new();
-    for bf16 in [false, true] {
-        let name = format!(
-            "fused_backward_pipeline_d64_{}_causal_permuted",
-            if bf16 { "bf16" } else { "f16" }
-        );
-        bwd_causal_permuted_fns.insert(bf16, load_flash(&name, 34816)?);
-    }
-    let mut bwd_fused_pipeline_fns = HashMap::new();
-    for bf16 in [false, true] {
-        for causal in [false, true] {
-            let name = format!(
-                "fused_backward_pipeline_d64_{}{}",
-                if bf16 { "bf16" } else { "f16" },
-                if causal { "_causal" } else { "" }
-            );
-            bwd_fused_pipeline_fns.insert(
-                (bf16, causal),
-                load_flash(&name, if causal { 34816 } else { 98304 })?,
             );
         }
     }
@@ -618,96 +529,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
             }
         }
     }
-    let mut bwd_fused_d32_fns = HashMap::new();
-    let mut bwd_fused_d64_fns = HashMap::new();
-    let mut bwd_fused_fns = HashMap::new();
-    for bf16 in [false, true] {
-        for partial in [false, true] {
-            for dropout in [false, true] {
-                for (mode, suffix) in [
-                    (0u8, "_plain"),
-                    (1, "_causal"),
-                    (2, ""),
-                    (3, "_causal_balanced"),
-                ] {
-                    let name = format!(
-                        "fused_backward_fused_d32_{}{}{}{}",
-                        if bf16 { "bf16" } else { "f16" },
-                        if dropout { "_drop" } else { "" },
-                        if partial { "_partial" } else { "" },
-                        suffix,
-                    );
-                    bwd_fused_d32_fns
-                        .insert((bf16, partial, dropout, mode), load_flash(&name, 21504)?);
-                    let name = format!(
-                        "fused_backward_fused_d64_{}{}{}{}",
-                        if bf16 { "bf16" } else { "f16" },
-                        if dropout { "_drop" } else { "" },
-                        if partial { "_partial" } else { "" },
-                        suffix,
-                    );
-                    bwd_fused_d64_fns
-                        .insert((bf16, partial, dropout, mode), load_flash(&name, 25600)?);
-                    let name = format!(
-                        "fused_backward_fused_{}{}{}{}",
-                        if bf16 { "bf16" } else { "f16" },
-                        if dropout { "_drop" } else { "" },
-                        if partial { "_partial" } else { "" },
-                        suffix,
-                    );
-                    bwd_fused_fns.insert((bf16, partial, dropout, mode), load_flash(&name, 50176)?);
-                }
-            }
-        }
-    }
-    for bf16 in [false, true] {
-        for dropout in [false, true] {
-            for (mode, suffix) in [(4u8, "plain"), (5, "causal"), (6, "masked")] {
-                let name = format!(
-                    "fused_backward_fused_{}_{}partial_query2_{}",
-                    if bf16 { "bf16" } else { "f16" },
-                    if dropout { "drop_" } else { "" },
-                    suffix
-                );
-                bwd_fused_fns.insert((bf16, true, dropout, mode), load_flash(&name, 50176)?);
-            }
-        }
-    }
-    for bf16 in [false, true] {
-        for (mode, suffix) in [(8u8, "plain"), (9, "causal"), (10, "masked")] {
-            let name = format!(
-                "fused_backward_fused_{}_partial_query4_{}",
-                if bf16 { "bf16" } else { "f16" },
-                suffix
-            );
-            bwd_fused_fns.insert((bf16, true, false, mode), load_flash(&name, 50176)?);
-        }
-    }
-    for bf16 in [false, true] {
-        let name = format!(
-            "fused_backward_fused_{}_drop_partial_query2_sign",
-            if bf16 { "bf16" } else { "f16" },
-        );
-        bwd_fused_fns.insert((bf16, true, true, 12), load_flash(&name, 50176)?);
-    }
-    for bf16 in [false, true] {
-        let name = format!(
-            "fused_backward_fused_{}_drop_partial_query2_balanced",
-            if bf16 { "bf16" } else { "f16" },
-        );
-        bwd_fused_fns.insert((bf16, true, true, 7), load_flash(&name, 50176)?);
-    }
-    let mut bwd_dense128_fns = HashMap::new();
-    for bf16 in [false, true] {
-        for (mode, suffix) in [(0u8, "plain"), (1, "causal")] {
-            let name = format!(
-                "fused_backward_dense_d128_{}_{}",
-                if bf16 { "bf16" } else { "f16" },
-                suffix
-            );
-            bwd_dense128_fns.insert((bf16, mode), load_flash(&name, 98304)?);
-        }
-    }
     let mut bwd_dkv_both_fns = HashMap::new();
     for bf16 in [false, true] {
         for partial in [false, true] {
@@ -730,7 +551,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
     }
     let mut bwd_dkv_specialized_fns = HashMap::new();
     let mut bwd_dkv_merge_fns = HashMap::new();
-    let mut bwd_grad_merge_fns = HashMap::new();
     for bf16 in [false, true] {
         for (mode, suffix) in [(0, "_plain"), (1, "_no_dropout"), (2, "")] {
             let name = format!(
@@ -752,8 +572,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
                 );
             }
         }
-        let name = format!("backward_grad_merge_{}", if bf16 { "bf16" } else { "f16" });
-        bwd_grad_merge_fns.insert(bf16, load_flash(&name, 0)?);
         let name = format!("backward_kv_merge_{}", if bf16 { "bf16" } else { "f16" });
         bwd_dkv_merge_fns.insert(
             bf16,
@@ -977,35 +795,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
             );
         }
     }
-    let mut varlen_fused_query_fns = HashMap::new();
-    for bf16 in [false, true] {
-        for (wide, causal) in [(false, false), (true, false), (false, true)] {
-            let name = format!(
-                "varlen_backward_fused_query{}_d64{}{}",
-                if wide { "_wide" } else { "" },
-                if causal { "_causal" } else { "" },
-                if bf16 { "_bf16" } else { "" }
-            );
-            varlen_fused_query_fns.insert(
-                (bf16, wide, causal),
-                load_flash(&name, if wide { 90112 } else { 98304 })?,
-            );
-        }
-    }
-    let mut varlen_fused_fns = HashMap::new();
-    for bf16 in [false, true] {
-        for causal in [false, true] {
-            for padded in [false, true] {
-                let name = format!(
-                    "varlen_backward_fused_d64{}{}{}",
-                    if causal { "_causal" } else { "" },
-                    if bf16 { "_bf16" } else { "" },
-                    if padded { "_padded" } else { "" }
-                );
-                varlen_fused_fns.insert((bf16, causal, padded), load_flash(&name, 34816)?);
-            }
-        }
-    }
     let mut varlen_dkv_combined_fns = HashMap::new();
     for bf16 in [false, true] {
         let name = format!(
@@ -1093,25 +882,15 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
         bwd_dq_swizzled_fns,
         bwd_dq_split_fns,
         bwd_dq_merge_fns,
-        bwd_packed_dq_merge_fns,
         bwd_dkv_both_fns,
-        bwd_fused_fns,
-        bwd_dense128_fns,
-        bwd_fused_d32_fns,
-        bwd_fused_d64_fns,
         bwd_generic_fns,
         bwd_generic_dq_fns,
         bwd_wide_dq_fns,
         varlen_generic_fns,
         varlen_generic_dq_fns,
-        bwd_fused_wide_pipeline_fns,
-        bwd_fused_pipeline_fns,
-        bwd_causal_query_fns,
-        bwd_causal_permuted_fns,
         bwd_dkv_fns,
         bwd_dkv_specialized_fns,
         bwd_dkv_merge_fns,
-        bwd_grad_merge_fns,
         varlen_rng_fns,
         varlen_fns,
         paged_fns,
@@ -1128,8 +907,6 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
         varlen_bwd_partial_fns,
         varlen_bwd_causal_fns,
         varlen_dkv_combined_fns,
-        varlen_fused_fns,
-        varlen_fused_query_fns,
         varlen_dq_split_fns,
         varlen_preprocess_fns,
         resolve_rng: module

@@ -615,53 +615,29 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d32_dropout = Varlen<false, 32, 2, 4, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d32_bf16_dropout = Varlen<true, 32, 2, 4, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_dropout = Varlen<false, 64, 4, 8, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_bf16_dropout = Varlen<true, 64, 4, 8, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_dropout = Varlen<false, 96, 6, 12, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_bf16_dropout = Varlen<true, 96, 6, 12, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_dropout = Varlen<false, 128, 8, 16, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_bf16_dropout = Varlen<true, 128, 8, 16, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_dropout = Varlen<false, 192, 12, 24, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_bf16_dropout = Varlen<true, 192, 12, 24, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_dropout = Varlen<false, 256, 16, 32, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_bf16_dropout = Varlen<true, 256, 16, 32, 32, 4, 2, true, false, false>;
 #[kernel(
     d32,
@@ -1018,89 +994,53 @@ unsafe fn write_packed_output<const BF16: bool, const NFO: usize, const PARTIAL:
 }
 
 // Causal prefill over 256-row pages: folded config and v2's split-KV key tiles.
-#[allow(non_camel_case_types)]
 pub type paged_d32_causal256 =
     Varlen<false, 32, 2, 4, 128, 16, 8, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_causal256_bf16 =
     Varlen<true, 32, 2, 4, 128, 16, 8, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_dropout = Varlen<false, 32, 2, 4, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_bf16_dropout = Varlen<true, 32, 2, 4, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_causal256 =
     Varlen<false, 64, 4, 8, 64, 8, 4, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_causal256_bf16 =
     Varlen<true, 64, 4, 8, 64, 8, 4, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_dropout = Varlen<false, 64, 4, 8, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_bf16_dropout = Varlen<true, 64, 4, 8, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_causal256 =
     Varlen<false, 96, 6, 12, 128, 16, 8, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_causal256_bf16 =
     Varlen<true, 96, 6, 12, 128, 16, 8, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_dropout = Varlen<false, 96, 6, 12, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_bf16_dropout = Varlen<true, 96, 6, 12, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_causal256 =
     Varlen<false, 128, 8, 16, 128, 16, 8, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_causal256_bf16 =
     Varlen<true, 128, 8, 16, 128, 16, 8, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_dropout = Varlen<false, 128, 8, 16, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_bf16_dropout = Varlen<true, 128, 8, 16, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_causal256 =
     Varlen<false, 192, 12, 24, 64, 8, 4, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_causal256_bf16 =
     Varlen<true, 192, 12, 24, 64, 8, 4, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_dropout = Varlen<false, 192, 12, 24, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_bf16_dropout = Varlen<true, 192, 12, 24, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_causal256 =
     Varlen<false, 256, 16, 32, 64, 8, 4, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_causal256_bf16 =
     Varlen<true, 256, 16, 32, 64, 8, 4, false, true, false, false, false, 256, true>;
-#[allow(non_camel_case_types)]
 pub type paged_d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_dropout = Varlen<false, 256, 16, 32, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_bf16_dropout = Varlen<true, 256, 16, 32, 32, 4, 2, true, true, false>;
 #[kernel(
     paged_d32_causal256,
@@ -1262,126 +1202,78 @@ pub fn paged_fwd<S: Spec>(
     }
 }
 
-#[allow(non_camel_case_types)]
 pub type cache_d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_paged = Varlen<false, 32, 2, 4, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_bf16_paged = Varlen<true, 32, 2, 4, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_paged = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_bf16_paged = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_paged = Varlen<false, 96, 6, 12, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_bf16_paged = Varlen<true, 96, 6, 12, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_paged = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_bf16_paged = Varlen<true, 128, 8, 16, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_paged = Varlen<false, 192, 12, 24, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_bf16_paged = Varlen<true, 192, 12, 24, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_paged = Varlen<false, 256, 16, 32, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_bf16_paged = Varlen<true, 256, 16, 32, 32, 4, 2, false, true, true>;
 // Unsplit decode with v2's split-KV key tiles (256/128/64 by head dim), raw
 // scores and an optional fused append; grouped variants own one KV head.
-#[allow(non_camel_case_types)]
 pub type cache_d32_wide =
     Varlen<false, 32, 2, 4, 256, 32, 16, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_wide_bf16 =
     Varlen<true, 32, 2, 4, 256, 32, 16, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_wide_grouped =
     Varlen<false, 32, 2, 4, 256, 32, 16, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_wide_grouped_bf16 =
     Varlen<true, 32, 2, 4, 256, 32, 16, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_wide =
     Varlen<false, 64, 4, 8, 256, 32, 16, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_wide_bf16 =
     Varlen<true, 64, 4, 8, 256, 32, 16, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_wide_grouped =
     Varlen<false, 64, 4, 8, 256, 32, 16, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_wide_grouped_bf16 =
     Varlen<true, 64, 4, 8, 256, 32, 16, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_wide =
     Varlen<false, 96, 6, 12, 128, 16, 8, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_wide_bf16 =
     Varlen<true, 96, 6, 12, 128, 16, 8, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_wide_grouped =
     Varlen<false, 96, 6, 12, 128, 16, 8, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_wide_grouped_bf16 =
     Varlen<true, 96, 6, 12, 128, 16, 8, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_wide =
     Varlen<false, 128, 8, 16, 128, 16, 8, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_wide_bf16 =
     Varlen<true, 128, 8, 16, 128, 16, 8, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_wide_grouped =
     Varlen<false, 128, 8, 16, 128, 16, 8, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_wide_grouped_bf16 =
     Varlen<true, 128, 8, 16, 128, 16, 8, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_wide =
     Varlen<false, 192, 12, 24, 64, 8, 4, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_wide_bf16 =
     Varlen<true, 192, 12, 24, 64, 8, 4, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_wide_grouped =
     Varlen<false, 192, 12, 24, 64, 8, 4, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_wide_grouped_bf16 =
     Varlen<true, 192, 12, 24, 64, 8, 4, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_wide =
     Varlen<false, 256, 16, 32, 64, 8, 4, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_wide_bf16 =
     Varlen<true, 256, 16, 32, 64, 8, 4, false, false, true, false, false, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_wide_grouped =
     Varlen<false, 256, 16, 32, 64, 8, 4, false, false, true, false, true, 0, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_wide_grouped_bf16 =
     Varlen<true, 256, 16, 32, 64, 8, 4, false, false, true, false, true, 0, false, true>;
 #[kernel(
@@ -1588,83 +1480,47 @@ pub fn cached_fwd<S: Spec>(
 }
 
 // FP32 partial-output specializations for cached split-K attention.
-#[allow(non_camel_case_types)]
 pub type split_d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_paged = Varlen<false, 32, 2, 4, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_bf16_paged = Varlen<true, 32, 2, 4, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_paged = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_bf16_paged = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_paged = Varlen<false, 96, 6, 12, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_bf16_paged = Varlen<true, 96, 6, 12, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_paged = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_bf16_paged = Varlen<true, 128, 8, 16, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_paged = Varlen<false, 192, 12, 24, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_bf16_paged = Varlen<true, 192, 12, 24, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_paged = Varlen<false, 256, 16, 32, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_bf16_paged = Varlen<true, 256, 16, 32, 32, 4, 2, false, true, true, true>;
 // Packed decode reuses the split core while reading cumulative lengths.
-#[allow(non_camel_case_types)]
 pub type packed_split_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d64_paged = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d64_bf16_paged = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128_paged = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128_bf16_paged =
     Varlen<true, 128, 8, 16, 32, 4, 2, false, true, false, true>;
 
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128 =
     Varlen<false, 128, 8, 16, 32, 4, 2, false, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128_paged =
     Varlen<false, 128, 8, 16, 32, 4, 2, false, true, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128_bf16 =
     Varlen<true, 128, 8, 16, 32, 4, 2, false, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128_bf16_paged =
     Varlen<true, 128, 8, 16, 32, 4, 2, false, true, false, true, true>;
 

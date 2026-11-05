@@ -665,29 +665,10 @@ pub trait Spec {
         meta: Packed,
     );
 }
-// Compute dK and dV in the same warps so QK/probabilities are evaluated once.
-// Deterministic calls keep dQ separate; the fused variant accumulates it atomically.
-pub struct CombinedDkv<
-    const BF16: bool,
-    const FUSED: bool = false,
-    const CAUSAL: bool = false,
-    const KEY_ROWS: usize = 64,
-    const QUERY_ROWS: usize = 32,
-    const NQT: usize = 4,
-    const PV_CHUNKS: usize = 2,
-    const PADDED: bool = false,
->;
-impl<
-    const BF16: bool,
-    const FUSED: bool,
-    const CAUSAL: bool,
-    const KEY_ROWS: usize,
-    const QUERY_ROWS: usize,
-    const NQT: usize,
-    const PV_CHUNKS: usize,
-    const PADDED: bool,
-> Spec for CombinedDkv<BF16, FUSED, CAUSAL, KEY_ROWS, QUERY_ROWS, NQT, PV_CHUNKS, PADDED>
-{
+// Compute dK and dV in the same warps so QK/probabilities are evaluated once;
+// dQ stays separate for deterministic calls.
+pub struct CombinedDkv<const BF16: bool>;
+impl<const BF16: bool> Spec for CombinedDkv<BF16> {
     #[inline(always)]
     unsafe fn run(
         q: *const u32,
@@ -696,7 +677,7 @@ impl<
         dout: *const u32,
         lse: *const f32,
         delta: *const f32,
-        dq: *mut u32,
+        _dq: *mut u32,
         dk: *mut u32,
         dv: *mut u32,
         alibi: *const f32,
@@ -709,127 +690,15 @@ impl<
         unsafe {
             let b = thread::blockIdx_z();
             let seq = meta.sequence(b);
-            if !meta.valid(seq, &cfg) || thread::blockIdx_x() * KEY_ROWS as u32 >= seq.sk {
+            if !meta.valid(seq, &cfg) || thread::blockIdx_x() * 64 >= seq.sk {
                 return;
             }
             cfg.seqlen_q = seq.sq;
             cfg.seqlen_k = seq.sk;
             cfg.tanh_scale = 0.0;
             cfg.has_alibi = 0;
-            if FUSED {
-                cfg.window_left = -1;
-                cfg.window_right = if CAUSAL { 0 } else { -1 };
-            }
             let output_stride = (cfg.h / cfg.gqa * cfg.hs_u32) as usize;
-            if FUSED && KEY_ROWS == 256 {
-                if seq.sq % 16 == 0 && seq.sk % 256 == 0 {
-                    crate::device::backward::query_wide_core::<BF16, true>(
-                        q.add(seq.qs as usize * cfg.q.seq as usize),
-                        k.add(seq.ks as usize * cfg.k.seq as usize),
-                        v.add(seq.ks as usize * cfg.v.seq as usize),
-                        dout.add(seq.qs as usize * do_strides.seq as usize),
-                        lse.add(seq.qs as usize),
-                        delta.add(seq.qs as usize + b as usize * 128),
-                        dk.add(seq.ks as usize * output_stride),
-                        dv.add(seq.ks as usize * output_stride),
-                        dq.cast::<f32>().add(
-                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
-                                * cfg.h as usize
-                                * 64,
-                        ),
-                        cfg,
-                        do_strides,
-                        gradient_scale,
-                        Some((meta.total_q, meta.delta_stride)),
-                    );
-                } else {
-                    crate::device::backward::query_wide_core::<BF16, false>(
-                        q.add(seq.qs as usize * cfg.q.seq as usize),
-                        k.add(seq.ks as usize * cfg.k.seq as usize),
-                        v.add(seq.ks as usize * cfg.v.seq as usize),
-                        dout.add(seq.qs as usize * do_strides.seq as usize),
-                        lse.add(seq.qs as usize),
-                        delta.add(seq.qs as usize + b as usize * 128),
-                        dk.add(seq.ks as usize * output_stride),
-                        dv.add(seq.ks as usize * output_stride),
-                        dq.cast::<f32>().add(
-                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
-                                * cfg.h as usize
-                                * 64,
-                        ),
-                        cfg,
-                        do_strides,
-                        gradient_scale,
-                        Some((meta.total_q, meta.delta_stride)),
-                    );
-                }
-                return;
-            }
-            if FUSED && KEY_ROWS == 128 {
-                if seq.sq % 64 == 0 && seq.sk % 128 == 0 {
-                    crate::device::backward::query_core::<BF16, true>(
-                        q.add(seq.qs as usize * cfg.q.seq as usize),
-                        k.add(seq.ks as usize * cfg.k.seq as usize),
-                        v.add(seq.ks as usize * cfg.v.seq as usize),
-                        dout.add(seq.qs as usize * do_strides.seq as usize),
-                        lse.add(seq.qs as usize),
-                        delta.add(seq.qs as usize + b as usize * 128),
-                        dk.add(seq.ks as usize * output_stride),
-                        dv.add(seq.ks as usize * output_stride),
-                        dq.cast::<f32>().add(
-                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
-                                * cfg.h as usize
-                                * 64,
-                        ),
-                        cfg,
-                        do_strides,
-                        gradient_scale,
-                        Some((meta.total_q, meta.delta_stride)),
-                    );
-                } else {
-                    crate::device::backward::query_core::<BF16, false>(
-                        q.add(seq.qs as usize * cfg.q.seq as usize),
-                        k.add(seq.ks as usize * cfg.k.seq as usize),
-                        v.add(seq.ks as usize * cfg.v.seq as usize),
-                        dout.add(seq.qs as usize * do_strides.seq as usize),
-                        lse.add(seq.qs as usize),
-                        delta.add(seq.qs as usize + b as usize * 128),
-                        dk.add(seq.ks as usize * output_stride),
-                        dv.add(seq.ks as usize * output_stride),
-                        dq.cast::<f32>().add(
-                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
-                                * cfg.h as usize
-                                * 64,
-                        ),
-                        cfg,
-                        do_strides,
-                        gradient_scale,
-                        Some((meta.total_q, meta.delta_stride)),
-                    );
-                }
-                return;
-            }
-
-            crate::device::backward::dkv_both_core::<
-                BF16,
-                64,
-                4,
-                8,
-                false,
-                false,
-                false,
-                FUSED,
-                0,
-                32,
-                KEY_ROWS,
-                FUSED,
-                QUERY_ROWS,
-                NQT,
-                PV_CHUNKS,
-                1,
-                PADDED,
-                false,
-            >(
+            crate::device::backward::dkv_both_core::<BF16, 64, 4, 8, false, false, false, 32>(
                 q.add(seq.qs as usize * cfg.q.seq as usize),
                 k.add(seq.ks as usize * cfg.k.seq as usize),
                 v.add(seq.ks as usize * cfg.v.seq as usize),
@@ -838,16 +707,6 @@ impl<
                 delta.add(seq.qs as usize + b as usize * 128),
                 dk.add(seq.ks as usize * output_stride),
                 dv.add(seq.ks as usize * output_stride),
-                if FUSED {
-                    dq.cast::<f32>().add(
-                        (seq.qs as usize + if PADDED { b as usize * 32 } else { 0 })
-                            * cfg.h as usize
-                            * cfg.hs_u32 as usize
-                            * 2,
-                    )
-                } else {
-                    core::ptr::null_mut()
-                },
                 alibi,
                 cfg,
                 do_strides,
@@ -858,43 +717,8 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type dkv_d64_combined = CombinedDkv<false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_combined_bf16 = CombinedDkv<true>;
-
-#[allow(non_camel_case_types)]
-pub type fused_d64 = CombinedDkv<false, true, false, 64, 32, 4, 2>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16 = CombinedDkv<true, true, false, 64, 32, 4, 2>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_causal = CombinedDkv<false, true, true, 64, 32, 4, 2>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_causal_bf16 = CombinedDkv<true, true, true, 64, 32, 4, 2>;
-
-#[allow(non_camel_case_types)]
-pub type fused_query_d64 = CombinedDkv<false, true, false, 128, 64, 8, 4>;
-#[allow(non_camel_case_types)]
-pub type fused_query_d64_bf16 = CombinedDkv<true, true, false, 128, 64, 8, 4>;
-
-#[allow(non_camel_case_types)]
-pub type fused_query_d64_causal = CombinedDkv<false, true, true, 128, 64, 8, 4>;
-#[allow(non_camel_case_types)]
-pub type fused_query_d64_causal_bf16 = CombinedDkv<true, true, true, 128, 64, 8, 4>;
-
-#[allow(non_camel_case_types)]
-pub type fused_query_wide_d64 = CombinedDkv<false, true, false, 256, 16, 2, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_query_wide_d64_bf16 = CombinedDkv<true, true, false, 256, 16, 2, 1>;
-
-#[allow(non_camel_case_types)]
-pub type fused_d64_padded = CombinedDkv<false, true, false, 64, 32, 4, 2, true>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_padded = CombinedDkv<true, true, false, 64, 32, 4, 2, true>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_causal_padded = CombinedDkv<false, true, true, 64, 32, 4, 2, true>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_causal_bf16_padded = CombinedDkv<true, true, true, 64, 32, 4, 2, true>;
 
 pub struct Backward<
     const BF16: bool,
@@ -980,93 +804,49 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type dq_d32 = Backward<false, 32, 2, 4, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32 = Backward<false, 32, 2, 4, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d32_bf16 = Backward<true, 32, 2, 4, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_bf16 = Backward<true, 32, 2, 4, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64 = Backward<false, 64, 4, 8, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64 = Backward<false, 64, 4, 8, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_bf16 = Backward<true, 64, 4, 8, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_bf16 = Backward<true, 64, 4, 8, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d96 = Backward<false, 96, 6, 12, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96 = Backward<false, 96, 6, 12, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d96_bf16 = Backward<true, 96, 6, 12, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_bf16 = Backward<true, 96, 6, 12, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128 = Backward<false, 128, 8, 16, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128 = Backward<false, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_bf16 = Backward<true, 128, 8, 16, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_bf16 = Backward<true, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d192 = Backward<false, 192, 12, 24, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192 = Backward<false, 192, 12, 24, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d192_bf16 = Backward<true, 192, 12, 24, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_bf16 = Backward<true, 192, 12, 24, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d256 = Backward<false, 256, 16, 32, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256 = Backward<false, 256, 16, 32, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d256_bf16 = Backward<true, 256, 16, 32, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_bf16 = Backward<true, 256, 16, 32, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_partial = Backward<false, 32, 2, 4, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_partial_bf16 = Backward<true, 32, 2, 4, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial = Backward<false, 64, 4, 8, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial_bf16 = Backward<true, 64, 4, 8, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_partial = Backward<false, 96, 6, 12, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_partial_bf16 = Backward<true, 96, 6, 12, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial = Backward<false, 128, 8, 16, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_bf16 = Backward<true, 128, 8, 16, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_partial = Backward<false, 192, 12, 24, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_partial_bf16 = Backward<true, 192, 12, 24, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_partial = Backward<false, 256, 16, 32, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_partial_bf16 = Backward<true, 256, 16, 32, true, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2 = Backward<false, 64, 4, 8, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2_bf16 = Backward<true, 64, 4, 8, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split2 = Backward<false, 128, 8, 16, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split2_bf16 = Backward<true, 128, 8, 16, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial_causal = Backward<false, 64, 4, 8, true, true, 1, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial_causal_bf16 = Backward<true, 64, 4, 8, true, true, 1, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2_causal = Backward<false, 64, 4, 8, false, false, 2, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2_causal_bf16 = Backward<true, 64, 4, 8, false, false, 2, true>;
 
 // Head-dimension-generic fused backward for packed MHA without dropout,
@@ -1174,74 +954,42 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
-pub type generic_d32 = GenericPacked<false, false, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_causal =
-    GenericPacked<false, true, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16 =
-    GenericPacked<true, false, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_causal =
-    GenericPacked<true, true, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64 = GenericPacked<false, false, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_causal =
-    GenericPacked<false, true, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16 =
-    GenericPacked<true, false, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_causal =
-    GenericPacked<true, true, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96 = GenericPacked<false, false, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_causal =
-    GenericPacked<false, true, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16 =
-    GenericPacked<true, false, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_causal =
-    GenericPacked<true, true, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128 = GenericPacked<false, false, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_causal =
-    GenericPacked<false, true, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16 =
-    GenericPacked<true, false, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_causal =
-    GenericPacked<true, true, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192 =
-    GenericPacked<false, false, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_causal =
-    GenericPacked<false, true, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16 =
-    GenericPacked<true, false, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_causal =
-    GenericPacked<true, true, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256 =
-    GenericPacked<false, false, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_causal =
-    GenericPacked<false, true, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16 =
-    GenericPacked<true, false, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_causal =
-    GenericPacked<true, true, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+type PackedD32<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+type PackedD64<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+type PackedD96<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+type PackedD128<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+type PackedD192<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+type PackedD256<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+pub type generic_d32 = PackedD32<false, false>;
+pub type generic_d32_causal = PackedD32<false, true>;
+pub type generic_d32_bf16 = PackedD32<true, false>;
+pub type generic_d32_bf16_causal = PackedD32<true, true>;
+pub type generic_d64 = PackedD64<false, false>;
+pub type generic_d64_causal = PackedD64<false, true>;
+pub type generic_d64_bf16 = PackedD64<true, false>;
+pub type generic_d64_bf16_causal = PackedD64<true, true>;
+pub type generic_d96 = PackedD96<false, false>;
+pub type generic_d96_causal = PackedD96<false, true>;
+pub type generic_d96_bf16 = PackedD96<true, false>;
+pub type generic_d96_bf16_causal = PackedD96<true, true>;
+pub type generic_d128 = PackedD128<false, false>;
+pub type generic_d128_causal = PackedD128<false, true>;
+pub type generic_d128_bf16 = PackedD128<true, false>;
+pub type generic_d128_bf16_causal = PackedD128<true, true>;
+pub type generic_d192 = PackedD192<false, false>;
+pub type generic_d192_causal = PackedD192<false, true>;
+pub type generic_d192_bf16 = PackedD192<true, false>;
+pub type generic_d192_bf16_causal = PackedD192<true, true>;
+pub type generic_d256 = PackedD256<false, false>;
+pub type generic_d256_causal = PackedD256<false, true>;
+pub type generic_d256_bf16 = PackedD256<true, false>;
+pub type generic_d256_bf16_causal = PackedD256<true, true>;
 
 #[kernel(
     generic_d32,
@@ -1268,20 +1016,6 @@ pub type generic_d256_bf16_causal =
     generic_d256_causal,
     generic_d256_bf16,
     generic_d256_bf16_causal,
-    fused_d64_padded,
-    fused_d64_bf16_padded,
-    fused_d64_causal_padded,
-    fused_d64_causal_bf16_padded,
-    fused_query_wide_d64,
-    fused_query_wide_d64_bf16,
-    fused_query_d64,
-    fused_query_d64_bf16,
-    fused_query_d64_causal,
-    fused_query_d64_causal_bf16,
-    fused_d64,
-    fused_d64_bf16,
-    fused_d64_causal,
-    fused_d64_causal_bf16,
     dkv_d64_combined,
     dkv_d64_combined_bf16,
     dq_d64_split2_causal,

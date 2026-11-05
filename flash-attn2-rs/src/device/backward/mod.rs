@@ -5,9 +5,6 @@ mod dkv;
 mod dq;
 mod fused;
 mod generic;
-mod query;
-mod query128;
-mod query256;
 mod reduce;
 
 pub(crate) use common::{
@@ -15,6 +12,4 @@ pub(crate) use common::{
 };
 pub(crate) use dkv::dkv_both_core;
 pub(crate) use generic::{core as generic_core, grid_coords as generic_grid_coords};
-pub(crate) use query::core as query_core;
-pub(crate) use query256::core as query_wide_core;
 pub(crate) use reduce::{ReduceSpec, bf16_8, bf16_16, bf16_32, f16_8, f16_16, f16_32};

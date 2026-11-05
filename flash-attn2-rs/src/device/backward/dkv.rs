@@ -1,12 +1,11 @@
 use super::common::{
-    copy_rows, copy_rows_cta, copy_rows_swizzled_cta, fused_dq_tile, fused_dq_tile_d64,
-    fused_store_ds, probability_gradient, query_fragments, query_fragments_swizzled,
-    transposed_keep, transposed_paired_words, transposed_word_mask,
+    copy_rows, copy_rows_swizzled, probability_gradient, query_fragments, query_fragments_swizzled,
+    transposed_keep,
 };
 use crate::device::config::{FwdConfig, LaunchTile, Strides};
 use crate::device::dropout::Dropout;
-use crate::device::forward::{SmemLayout, accumulate_values, accumulate_values_paired, compute_qk};
-use crate::device::inlined::{cvt, cvt_relu};
+use crate::device::forward::{SmemLayout, accumulate_values, compute_qk};
+use crate::device::inlined::cvt;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::{DisjointSlice, kernel, launch_bounds, ptx_asm, thread};
 
@@ -273,17 +272,7 @@ pub(crate) unsafe fn dkv_both_core<
     const PARTIAL: bool,
     const DROPOUT: bool,
     const PLAIN: bool,
-    const FUSED: bool,
-    const ORDER: u32,
     const KSTRIDE: usize,
-    const KEY_ROWS: usize,
-    const PIPELINE: bool,
-    const QUERY_ROWS: usize,
-    const NQT: usize,
-    const PV_CHUNKS: usize,
-    const QUERY_SPLITS: u32,
-    const PERMUTE: bool,
-    const SIGN_DROP: bool,
 >(
     q: *const u32,
     k: *const u32,
@@ -293,7 +282,6 @@ pub(crate) unsafe fn dkv_both_core<
     delta: *const f32,
     dk: *mut u32,
     dv: *mut u32,
-    dq: *mut f32,
     alibi: *const f32,
     cfg: FwdConfig,
     do_strides: Strides,
@@ -309,21 +297,13 @@ pub(crate) unsafe fn dkv_both_core<
         } else {
             thread::blockIdx_z()
         };
-        let output_slot = thread::blockIdx_y();
-        let query_splits = QUERY_SPLITS;
-        let output_head = output_slot / query_splits;
-        let query_split = output_slot % query_splits;
+        let output_head = thread::blockIdx_y();
         let kh = if PARTIAL {
             output_head / cfg.gqa
         } else {
             output_head
         };
-        let key_block = if ORDER == 3 && b % 2 == 1 {
-            cfg.seqlen_k.div_ceil(KEY_ROWS as u32) - 1 - thread::blockIdx_x()
-        } else {
-            thread::blockIdx_x()
-        };
-        let key_start = key_block * KEY_ROWS as u32;
+        let key_start = thread::blockIdx_x() * 64;
         let mut tile = LaunchTile {
             tid,
             lane_id: lane,
@@ -341,9 +321,9 @@ pub(crate) unsafe fn dkv_both_core<
         let scratch = DynamicSharedArray::<u32, 16>::get() as usize as *mut u32;
         let mut k_frag = [[0u32; 4]; NFQ];
         let mut v_frag = [[0u32; 4]; NFQ];
-        let (mut q_shared, mut do_shared) = if FUSED || DROPOUT || !PLAIN {
+        let (q_shared, do_shared) = if DROPOUT || !PLAIN {
             // K/V stay in shared memory to free registers before Philox.
-            copy_rows_swizzled_cta::<KEY_ROWS, KSTRIDE, KEY_ROWS>(
+            copy_rows_swizzled::<64, KSTRIDE>(
                 k,
                 scratch,
                 b as usize * cfg.k.batch as usize + kh as usize * cfg.k.head as usize,
@@ -353,9 +333,9 @@ pub(crate) unsafe fn dkv_both_core<
                 cfg.hs_u32,
                 tid,
             );
-            copy_rows_swizzled_cta::<KEY_ROWS, KSTRIDE, KEY_ROWS>(
+            copy_rows_swizzled::<64, KSTRIDE>(
                 v,
-                scratch.add(KEY_ROWS * KSTRIDE),
+                scratch.add(64 * KSTRIDE),
                 b as usize * cfg.v.batch as usize + kh as usize * cfg.v.head as usize,
                 key_start,
                 cfg.v.seq,
@@ -368,11 +348,11 @@ pub(crate) unsafe fn dkv_both_core<
                 clobber("memory")
             );
             thread::sync_threads();
-            let q_shared = scratch.add(2 * KEY_ROWS * KSTRIDE);
-            (q_shared, q_shared.add(QUERY_ROWS * layout.stride))
+            let q_shared = scratch.add(128 * KSTRIDE);
+            (q_shared, q_shared.add(32 * layout.stride))
         } else {
             // Barriers protect each change of shared-memory ownership.
-            copy_rows_cta::<HD, KEY_ROWS, KEY_ROWS>(
+            copy_rows::<HD, 64>(
                 k,
                 scratch,
                 b as usize * cfg.k.batch as usize + kh as usize * cfg.k.head as usize,
@@ -389,7 +369,7 @@ pub(crate) unsafe fn dkv_both_core<
             thread::sync_threads();
             k_frag = query_fragments::<NFQ>(scratch, &tile, layout);
             thread::sync_threads();
-            copy_rows_cta::<HD, KEY_ROWS, KEY_ROWS>(
+            copy_rows::<HD, 64>(
                 v,
                 scratch,
                 b as usize * cfg.v.batch as usize + kh as usize * cfg.v.head as usize,
@@ -406,37 +386,25 @@ pub(crate) unsafe fn dkv_both_core<
             thread::sync_threads();
             v_frag = query_fragments::<NFQ>(scratch, &tile, layout);
             thread::sync_threads();
-            (scratch, scratch.add(QUERY_ROWS * layout.stride))
+            (scratch, scratch.add(32 * layout.stride))
         };
-        let q_staging = q_shared;
         let (lse_stride, rounded_q) =
             packed_strides.unwrap_or((cfg.seqlen_q, cfg.seqlen_q.div_ceil(128) * 128));
         // Restrict the query loop to tiles that can attend to this key tile.
         let off = cfg.seqlen_k as i64 - cfg.seqlen_q as i64;
         let first = if cfg.window_right >= 0 {
             (key_start as i64 - off - cfg.window_right as i64).clamp(0, cfg.seqlen_q as i64) as u32
-                / QUERY_ROWS as u32
+                / 32
         } else {
             0
         };
         let end = if cfg.window_left >= 0 {
-            ((key_start + KEY_ROWS as u32).min(cfg.seqlen_k) as i64 - off + cfg.window_left as i64)
+            ((key_start + 64).min(cfg.seqlen_k) as i64 - off + cfg.window_left as i64)
                 .clamp(0, cfg.seqlen_q as i64) as u32
         } else {
             cfg.seqlen_q
         }
-        .div_ceil(QUERY_ROWS as u32);
-        // Partition only the visible query tiles, including causal/window bounds.
-        // Adjacent output slots hold partial dK/dV for the existing head merge.
-        let (first, end) = if QUERY_SPLITS > 1 {
-            let query_span = (end - first).div_ceil(QUERY_SPLITS);
-            (
-                (first + query_split * query_span).min(end),
-                (first + (query_split + 1) * query_span).min(end),
-            )
-        } else {
-            (first, end)
-        };
+        .div_ceil(32);
         let mut acc_k = [[0.0f32; 4]; NFO];
         let mut acc_v = [[0.0f32; 4]; NFO];
         let mut group_head = if PARTIAL { output_head % cfg.gqa } else { 0 };
@@ -458,127 +426,43 @@ pub(crate) unsafe fn dkv_both_core<
             } else {
                 0.0
             };
-            // Distribute atomic dQ updates across query tiles instead of making
-            // every resident key block start at the same output rows.
-            let query_shift = if PIPELINE
-                && ORDER == 0
-                && cfg.window_right < 0
-                && cfg.window_left < 0
-                && cfg.seqlen_q >= 2048
-                && end > first
-            {
-                (key_start / QUERY_ROWS as u32) % (end - first)
-            } else {
-                0
-            };
-            let query_block = |block: u32| {
-                let shifted = block + query_shift;
-                if shifted >= end {
-                    shifted - (end - first)
-                } else {
-                    shifted
-                }
-            };
             let mut block = first;
-            if PIPELINE && first < end {
-                copy_rows_cta::<HD, QUERY_ROWS, KEY_ROWS>(
+            while block < end {
+                let query_start = block * 32;
+                copy_rows::<HD, 32>(
                     q,
-                    q_staging,
+                    q_shared,
                     q_base,
-                    query_block(first) * QUERY_ROWS as u32,
+                    query_start,
                     cfg.q.seq,
                     cfg.seqlen_q,
                     cfg.hs_u32,
                     tid,
                 );
-                copy_rows_cta::<HD, QUERY_ROWS, KEY_ROWS>(
+                copy_rows::<HD, 32>(
                     dout,
-                    q_staging.add(QUERY_ROWS * layout.stride),
+                    do_shared,
                     do_base,
-                    query_block(first) * QUERY_ROWS as u32,
+                    query_start,
                     do_strides.seq,
                     cfg.seqlen_q,
                     cfg.hs_u32,
                     tid,
                 );
-                ptx_asm!("cp.async.commit_group;", clobber("memory"));
-            }
-            while block < end {
-                let query_start = query_block(block) * QUERY_ROWS as u32;
-                if PIPELINE {
-                    q_shared = q_staging
-                        .add(((block - first) % 2) as usize * 2 * QUERY_ROWS * layout.stride);
-                    do_shared = q_shared.add(QUERY_ROWS * layout.stride);
-                    ptx_asm!("cp.async.wait_group 0;", clobber("memory"));
-                    thread::sync_threads();
-                    if block + 1 < end {
-                        let next_q = q_staging.add(
-                            ((block - first + 1) % 2) as usize * 2 * QUERY_ROWS * layout.stride,
-                        );
-                        copy_rows_cta::<HD, QUERY_ROWS, KEY_ROWS>(
-                            q,
-                            next_q,
-                            q_base,
-                            query_block(block + 1) * QUERY_ROWS as u32,
-                            cfg.q.seq,
-                            cfg.seqlen_q,
-                            cfg.hs_u32,
-                            tid,
-                        );
-                        copy_rows_cta::<HD, QUERY_ROWS, KEY_ROWS>(
-                            dout,
-                            next_q.add(QUERY_ROWS * layout.stride),
-                            do_base,
-                            query_block(block + 1) * QUERY_ROWS as u32,
-                            do_strides.seq,
-                            cfg.seqlen_q,
-                            cfg.hs_u32,
-                            tid,
-                        );
-                        ptx_asm!("cp.async.commit_group;", clobber("memory"));
-                    }
-                } else {
-                    copy_rows_cta::<HD, QUERY_ROWS, KEY_ROWS>(
-                        q,
-                        q_shared,
-                        q_base,
-                        query_start,
-                        cfg.q.seq,
-                        cfg.seqlen_q,
-                        cfg.hs_u32,
-                        tid,
-                    );
-                    copy_rows_cta::<HD, QUERY_ROWS, KEY_ROWS>(
-                        dout,
-                        do_shared,
-                        do_base,
-                        query_start,
-                        do_strides.seq,
-                        cfg.seqlen_q,
-                        cfg.hs_u32,
-                        tid,
-                    );
-                    ptx_asm!(
-                        "cp.async.commit_group; cp.async.wait_group 0;",
-                        clobber("memory")
-                    );
-                    thread::sync_threads();
-                }
-                let mut scores = [[0.0f32; 4]; NQT];
-                if FUSED || DROPOUT || !PLAIN {
+                ptx_asm!(
+                    "cp.async.commit_group; cp.async.wait_group 0;",
+                    clobber("memory")
+                );
+                thread::sync_threads();
+                let mut scores = [[0.0f32; 4]; 4];
+                if DROPOUT || !PLAIN {
                     let fragments = query_fragments_swizzled::<NFQ, KSTRIDE>(scratch, &tile);
-                    compute_qk::<BF16, 1, NFQ, NQT>(
-                        &mut scores,
-                        &fragments,
-                        q_shared,
-                        &tile,
-                        layout,
-                    );
+                    compute_qk::<BF16, 1, NFQ, 4>(&mut scores, &fragments, q_shared, &tile, layout);
                 } else {
-                    compute_qk::<BF16, 1, NFQ, NQT>(&mut scores, &k_frag, q_shared, &tile, layout);
+                    compute_qk::<BF16, 1, NFQ, 4>(&mut scores, &k_frag, q_shared, &tile, layout);
                 }
                 let mut nt = 0;
-                while nt < NQT {
+                while nt < 4 {
                     thread::__unroll_config::<0>();
                     let query = query_start + nt as u32 * 8 + tile.pair * 2;
                     let l0 = if query < cfg.seqlen_q {
@@ -601,162 +485,76 @@ pub(crate) unsafe fn dkv_both_core<
                     nt += 1;
                 }
                 if DROPOUT {
-                    // Plain split-query tiles encode dropout before dP so Philox does not
-                    // overlap the dP accumulator's lifetime.
-                    if SIGN_DROP {
-                        let mut words = [0u32; 4];
-                        nt = 0;
-                        while nt < NQT {
-                            thread::__unroll_config::<0>();
-                            let query = query_start + nt as u32 * 8 + tile.pair * 2;
-                            if nt % 2 == 0 {
-                                words = transposed_paired_words(dropout, tile.bh, query, key);
-                            }
-                            let mask = transposed_word_mask(words, dropout.threshold, query, key);
-                            let mut i = 0;
-                            while i < 4 {
-                                thread::__unroll_config::<0>();
-                                if mask[i] == 0.0 {
-                                    scores[nt][i] = -scores[nt][i];
-                                }
-                                i += 1;
-                            }
-                            nt += 1;
-                        }
-                    }
-                    let mut dp = [[0.0f32; 4]; NQT];
+                    let mut dp = [[0.0f32; 4]; 4];
                     {
                         let fragments = query_fragments_swizzled::<NFQ, KSTRIDE>(
-                            scratch.add(KEY_ROWS * KSTRIDE),
+                            scratch.add(64 * KSTRIDE),
                             &tile,
                         );
-                        compute_qk::<BF16, 1, NFQ, NQT>(
+                        compute_qk::<BF16, 1, NFQ, 4>(
                             &mut dp, &fragments, do_shared, &tile, layout,
                         );
                     }
-                    let mut packed_k = [[0u32; 2]; NQT];
-                    let mut packed_v = [[0u32; 2]; NQT];
-                    // 8-query fragments pick different bytes of the same words.
-                    let mut mask_words = [0u32; 4];
+                    let mut packed_k = [[0u32; 2]; 4];
+                    let mut packed_v = [[0u32; 2]; 4];
                     nt = 0;
-                    while nt < NQT {
+                    while nt < 4 {
                         thread::__unroll_config::<0>();
                         let query = query_start + nt as u32 * 8 + tile.pair * 2;
-                        let mask = if SIGN_DROP {
-                            [1.0; 4]
-                        } else if FUSED {
-                            if nt % 2 == 0 {
-                                mask_words = transposed_paired_words(dropout, tile.bh, query, key);
-                            }
-                            transposed_word_mask(mask_words, dropout.threshold, query, key)
-                        } else {
-                            transposed_keep(dropout, tile.bh, query, key)
-                        };
+                        let mask = transposed_keep(dropout, tile.bh, query, key);
                         let d0 = *delta.add(tile.bh as usize * rounded_q as usize + query as usize);
                         let d1 =
                             *delta.add(tile.bh as usize * rounded_q as usize + query as usize + 1);
                         let p = scores[nt];
                         let x = dp[nt];
-                        let dk = if SIGN_DROP {
-                            [
-                                p[0] * if p[0] >= 0.0 { x[0] - d0 } else { d0 },
-                                p[1] * if p[1] >= 0.0 { x[1] - d1 } else { d1 },
-                                p[2] * if p[2] >= 0.0 { x[2] - d0 } else { d0 },
-                                p[3] * if p[3] >= 0.0 { x[3] - d1 } else { d1 },
-                            ]
-                        } else {
-                            [
-                                p[0] * (x[0] * mask[0] - d0),
-                                p[1] * (x[1] * mask[1] - d1),
-                                p[2] * (x[2] * mask[2] - d0),
-                                p[3] * (x[3] * mask[3] - d1),
-                            ]
-                        };
-                        let dv = if SIGN_DROP {
-                            p
-                        } else {
-                            [
-                                p[0] * mask[0],
-                                p[1] * mask[1],
-                                p[2] * mask[2],
-                                p[3] * mask[3],
-                            ]
-                        };
+                        let dk = [
+                            p[0] * (x[0] * mask[0] - d0),
+                            p[1] * (x[1] * mask[1] - d1),
+                            p[2] * (x[2] * mask[2] - d0),
+                            p[3] * (x[3] * mask[3] - d1),
+                        ];
+                        let dv = [
+                            p[0] * mask[0],
+                            p[1] * mask[1],
+                            p[2] * mask[2],
+                            p[3] * mask[3],
+                        ];
                         packed_k[nt] = [cvt::<BF16>(dk[0], dk[1]), cvt::<BF16>(dk[2], dk[3])];
-                        packed_v[nt] = if SIGN_DROP {
-                            [
-                                cvt_relu::<BF16>(dv[0], dv[1]),
-                                cvt_relu::<BF16>(dv[2], dv[3]),
-                            ]
-                        } else {
-                            [cvt::<BF16>(dv[0], dv[1]), cvt::<BF16>(dv[2], dv[3])]
-                        };
+                        packed_v[nt] = [cvt::<BF16>(dv[0], dv[1]), cvt::<BF16>(dv[2], dv[3])];
                         nt += 1;
                     }
-                    backward_accumulate_values::<
-                        BF16,
-                        1,
-                        NQT,
-                        NFO,
-                        PV_CHUNKS,
-                        FUSED,
-                        PARTIAL,
-                        DROPOUT,
-                        ORDER,
-                        QUERY_SPLITS,
-                    >(&mut acc_v, &packed_v, do_shared, &tile, layout);
-                    backward_accumulate_values::<
-                        BF16,
-                        1,
-                        NQT,
-                        NFO,
-                        PV_CHUNKS,
-                        FUSED,
-                        PARTIAL,
-                        DROPOUT,
-                        ORDER,
-                        QUERY_SPLITS,
-                    >(&mut acc_k, &packed_k, q_shared, &tile, layout);
-                    if FUSED {
-                        // Q/dOut are dead for every warp before dS replaces Q.
-                        thread::sync_threads();
-                        fused_store_ds::<NQT>(&packed_k, q_shared, tid);
-                    }
+                    accumulate_values::<BF16, 1, 4, NFO, 2>(
+                        &mut acc_v, &packed_v, do_shared, &tile, layout,
+                    );
+                    accumulate_values::<BF16, 1, 4, NFO, 2>(
+                        &mut acc_k, &packed_k, q_shared, &tile, layout,
+                    );
                 } else {
-                    let mut packed = [[0u32; 2]; NQT];
+                    let mut packed = [[0u32; 2]; 4];
                     nt = 0;
-                    while nt < NQT {
+                    while nt < 4 {
                         thread::__unroll_config::<0>();
                         let f = scores[nt];
                         packed[nt] = [cvt::<BF16>(f[0], f[1]), cvt::<BF16>(f[2], f[3])];
                         nt += 1;
                     }
-                    backward_accumulate_values::<
-                        BF16,
-                        1,
-                        NQT,
-                        NFO,
-                        PV_CHUNKS,
-                        FUSED,
-                        PARTIAL,
-                        DROPOUT,
-                        ORDER,
-                        QUERY_SPLITS,
-                    >(&mut acc_v, &packed, do_shared, &tile, layout);
-                    let mut dp = [[0.0f32; 4]; NQT];
-                    if FUSED || !PLAIN {
+                    accumulate_values::<BF16, 1, 4, NFO, 2>(
+                        &mut acc_v, &packed, do_shared, &tile, layout,
+                    );
+                    let mut dp = [[0.0f32; 4]; 4];
+                    if !PLAIN {
                         let fragments = query_fragments_swizzled::<NFQ, KSTRIDE>(
-                            scratch.add(KEY_ROWS * KSTRIDE),
+                            scratch.add(64 * KSTRIDE),
                             &tile,
                         );
-                        compute_qk::<BF16, 1, NFQ, NQT>(
+                        compute_qk::<BF16, 1, NFQ, 4>(
                             &mut dp, &fragments, do_shared, &tile, layout,
                         );
                     } else {
-                        compute_qk::<BF16, 1, NFQ, NQT>(&mut dp, &v_frag, do_shared, &tile, layout);
+                        compute_qk::<BF16, 1, NFQ, 4>(&mut dp, &v_frag, do_shared, &tile, layout);
                     }
                     nt = 0;
-                    while nt < NQT {
+                    while nt < 4 {
                         thread::__unroll_config::<0>();
                         let query = query_start + nt as u32 * 8 + tile.pair * 2;
                         let d0 = *delta.add(tile.bh as usize * rounded_q as usize + query as usize);
@@ -773,67 +571,19 @@ pub(crate) unsafe fn dkv_both_core<
                         packed[nt] = [cvt::<BF16>(f[0], f[1]), cvt::<BF16>(f[2], f[3])];
                         nt += 1;
                     }
-                    backward_accumulate_values::<
-                        BF16,
-                        1,
-                        NQT,
-                        NFO,
-                        PV_CHUNKS,
-                        FUSED,
-                        PARTIAL,
-                        DROPOUT,
-                        ORDER,
-                        QUERY_SPLITS,
-                    >(&mut acc_k, &packed, q_shared, &tile, layout);
-                    if FUSED {
-                        // Q/dOut are dead for every warp before dS replaces Q.
-                        thread::sync_threads();
-                        fused_store_ds::<NQT>(&packed, q_shared, tid);
-                    }
-                }
-                if FUSED {
-                    thread::sync_threads();
-                    if HD == 128 {
-                        fused_dq_tile::<BF16, DROPOUT, ORDER>(
-                            scratch,
-                            q_shared,
-                            dq,
-                            &cfg,
-                            &tile,
-                            query_start,
-                        );
-                    } else {
-                        fused_dq_tile_d64::<BF16, HD, NFQ, KSTRIDE, KEY_ROWS, QUERY_ROWS>(
-                            scratch,
-                            q_shared,
-                            dq,
-                            &cfg,
-                            &tile,
-                            query_start,
-                            // Retain the uniform length check: folding it away
-                            // worsens generated scheduling on SM89.
-                            PERMUTE
-                                && if packed_strides.is_some() {
-                                    cfg.hs_u32 == 32
-                                } else {
-                                    cfg.seqlen_q % 32 == 0
-                                },
-                        );
-                    }
+                    accumulate_values::<BF16, 1, 4, NFO, 2>(
+                        &mut acc_k, &packed, q_shared, &tile, layout,
+                    );
                 }
                 thread::sync_threads();
                 block += 1;
             }
             group_head += 1;
         }
-        let output_heads = if PARTIAL {
-            cfg.h * query_splits
-        } else {
-            cfg.h / cfg.gqa
-        };
+        let output_heads = if PARTIAL { cfg.h } else { cfg.h / cfg.gqa };
         let output_stride = output_heads as usize * cfg.hs_u32 as usize;
         let output_base = b as usize * cfg.seqlen_k as usize * output_stride
-            + output_slot as usize * cfg.hs_u32 as usize;
+            + output_head as usize * cfg.hs_u32 as usize;
         store_dkv_tile::<BF16, NFO, PARTIAL>(
             dk,
             &acc_k,
@@ -963,26 +713,7 @@ impl<
     ) {
         unsafe {
             if BOTH {
-                dkv_both_core::<
-                    BF16,
-                    HD,
-                    NFQ,
-                    NFO,
-                    PARTIAL,
-                    DROPOUT,
-                    PLAIN,
-                    false,
-                    0,
-                    64,
-                    64,
-                    false,
-                    32,
-                    4,
-                    2,
-                    1,
-                    false,
-                    false,
-                >(
+                dkv_both_core::<BF16, HD, NFQ, NFO, PARTIAL, DROPOUT, PLAIN, 64>(
                     q,
                     k,
                     v,
@@ -991,7 +722,6 @@ impl<
                     delta,
                     dk,
                     dv,
-                    core::ptr::null_mut(),
                     alibi,
                     cfg,
                     do_strides,
@@ -1019,81 +749,43 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type dkv_d32 = Dkv<false, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_bf16 = Dkv<true, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64 = Dkv<false, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_bf16 = Dkv<true, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96 = Dkv<false, 96, 6, 12>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_bf16 = Dkv<true, 96, 6, 12>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128 = Dkv<false, 128, 8, 16>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_bf16 = Dkv<true, 128, 8, 16>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192 = Dkv<false, 192, 12, 24>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_bf16 = Dkv<true, 192, 12, 24>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256 = Dkv<false, 256, 16, 32>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_bf16 = Dkv<true, 256, 16, 32>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial = Dkv<false, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_bf16 = Dkv<true, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_no_dropout = Dkv<false, 128, 8, 16, true, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_no_dropout_bf16 = Dkv<true, 128, 8, 16, true, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_plain = Dkv<false, 128, 8, 16, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_plain_bf16 = Dkv<true, 128, 8, 16, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_plain = Dkv<false, 128, 8, 16, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_plain_bf16 = Dkv<true, 128, 8, 16, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_no_dropout = Dkv<false, 128, 8, 16, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_no_dropout_bf16 = Dkv<true, 128, 8, 16, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both = Dkv<false, 128, 8, 16, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_bf16 = Dkv<true, 128, 8, 16, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both = Dkv<false, 128, 8, 16, true, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_bf16 = Dkv<true, 128, 8, 16, true, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_drop = Dkv<false, 128, 8, 16, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_drop_bf16 = Dkv<true, 128, 8, 16, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_drop = Dkv<false, 128, 8, 16, true, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_drop_bf16 = Dkv<true, 128, 8, 16, true, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked = Dkv<false, 128, 8, 16, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked_bf16 = Dkv<true, 128, 8, 16, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked_drop = Dkv<false, 128, 8, 16, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked_drop_bf16 = Dkv<true, 128, 8, 16, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked = Dkv<false, 128, 8, 16, true, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked_bf16 = Dkv<true, 128, 8, 16, true, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked_drop = Dkv<false, 128, 8, 16, true, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked_drop_bf16 = Dkv<true, 128, 8, 16, true, true, false, true>;
 #[kernel(
     dkv_d128_both_masked,
@@ -1240,48 +932,6 @@ pub fn backward_kv<S: DkvSpec>(
             },
             gradient_scale,
             dropout,
-        );
-    }
-}
-
-#[inline(always)]
-unsafe fn backward_accumulate_values<
-    const BF16: bool,
-    const RFRAGS: usize,
-    const NKT: usize,
-    const NFO: usize,
-    const PV_CHUNKS: usize,
-    const FUSED: bool,
-    const PARTIAL: bool,
-    const DROP: bool,
-    const MODE: u32,
-    const QUERY_SPLITS: u32,
->(
-    o_acc: &mut [[f32; 4]],
-    p_pack: &[[u32; 2]],
-    v_smem_base: *const u32,
-    tile: &LaunchTile,
-    layout: SmemLayout,
-) {
-    unsafe {
-        if !FUSED || NFO != 16 || !((DROP && QUERY_SPLITS == 1) || (!PARTIAL && MODE == 1)) {
-            accumulate_values::<BF16, RFRAGS, NKT, NFO, PV_CHUNKS>(
-                o_acc,
-                p_pack,
-                v_smem_base,
-                tile,
-                layout,
-            );
-            return;
-        }
-        // Paired loads help unsplit dropout and causal MHA, but the extra
-        // register pressure hurts non-dropout GQA and small split grids.
-        accumulate_values_paired::<BF16, RFRAGS, NKT, NFO, PV_CHUNKS>(
-            o_acc,
-            p_pack,
-            v_smem_base,
-            tile,
-            layout,
         );
     }
 }

@@ -209,37 +209,6 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
         && total_q > 0
         && total_k > 0
         && ((left < 0 && right < 0) || (left >= max_k && right == 0));
-    let fused = !generic
-        && combined_kv
-        && !deterministic
-        && total_q
-            .checked_mul(h)
-            .and_then(|n| n.checked_mul(d))
-            .and_then(|n| n.checked_mul(4))
-            .is_some_and(|bytes| bytes <= rt.l2_bytes / 2);
-    // Wider tiles amortize dQ atomics when long sequences fill the GPU.
-    let fused_query = fused
-        && max_q >= 1024
-        && max_k >= 1024
-        && total_q >= batch * 512
-        && total_k >= batch * 512
-        && batch * h * ((max_k + 127) / 128) >= rt.sm_count;
-    let wide_blocks = batch * h * ((max_k + 255) / 256);
-    let narrow_blocks = batch * h * ((max_k + 127) / 128);
-    let wide_waves = (wide_blocks + rt.sm_count - 1) / rt.sm_count;
-    let narrow_waves = (narrow_blocks + rt.sm_count - 1) / rt.sm_count;
-    let fused_query_wide =
-        fused_query && !alibi_causal && max_q >= 2048 && 2 * wide_waves <= narrow_waves;
-    // Query kernels and short packed sequences use padded accumulators.
-    // Other inputs retain their existing staging schedule.
-    let packed_permuted = fused && (fused_query || max_q <= 512);
-    let packed_tile_rows = if fused_query_wide {
-        16
-    } else if fused_query {
-        64
-    } else {
-        32
-    };
     // Expand underfilled GQA grids; FP32 partials bounded to half of L2.
     let partial_bytes = total_k
         .checked_mul(h)
@@ -287,21 +256,14 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     } else {
         1u32
     };
-    if fused || generic {
+    if generic {
         q_splits = 1;
     }
-    let q_partials = if q_splits > 1 || fused || generic {
+    let q_partials = if q_splits > 1 || generic {
         Some(alloc_tensor(
             &[
                 q_splits as i64,
-                total_q
-                    + if generic {
-                        128 * batch
-                    } else if packed_permuted {
-                        batch * packed_tile_rows
-                    } else {
-                        0
-                    },
+                total_q + if generic { 128 * batch } else { 0 },
                 h,
                 d,
             ],
@@ -311,7 +273,7 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     } else {
         None
     };
-    if (zero_tensors || fused || generic)
+    if (zero_tensors || generic)
         && let Some(partial) = &q_partials
     {
         unsafe {
@@ -596,36 +558,15 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     params.push((&mut gradient_scale as *mut f32).cast());
     params.push((&mut keep as *mut f32).cast());
     for kv in [false, true] {
-        if fused && !kv {
-            continue;
-        }
         let seq = if kv { max_k } else { max_q };
         let total = if kv { total_k } else { total_q };
         if seq == 0 || total == 0 || max_q == 0 || total_q == 0 {
             continue;
         }
-        let rows = if fused_query_wide {
-            256
-        } else if fused_query {
-            128
-        } else if kv && !combined_kv {
-            32
-        } else {
-            64
-        };
+        let rows = if kv && !combined_kv { 32 } else { 64 };
         unsafe {
             launch_kernel(
-                if fused_query {
-                    rt.varlen_fused_query_fns
-                        .get(&(bf16, fused_query_wide, alibi_causal))
-                        .unwrap()
-                        .cu_function()
-                } else if fused {
-                    rt.varlen_fused_fns
-                        .get(&(bf16, alibi_causal, packed_permuted))
-                        .unwrap()
-                        .cu_function()
-                } else if kv && combined_kv {
+                if kv && combined_kv {
                     rt.varlen_dkv_combined_fns.get(&bf16).unwrap().cu_function()
                 } else if d == 64
                     && cap <= 0.0
@@ -658,14 +599,8 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
                     (if kv && !parallel_gqa { hk } else { h }) as u32,
                     batch as u32,
                 ),
-                (if fused_query { 256 } else { 128 }, 1, 1),
-                if fused_query_wide {
-                    90112
-                } else if fused_query {
-                    98304
-                } else if fused {
-                    34816
-                } else if kv && combined_kv {
+                (128, 1, 1),
+                if kv && combined_kv {
                     25600
                 } else {
                     ((if kv { 128 } else { 192 }) * (bucket / 2 + 4) * 4) as u32
@@ -710,68 +645,32 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
         .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed GQA gradients: {e:?}")))?;
     }
     if let Some(partial) = &q_partials {
-        if packed_permuted {
-            let mut buffers = [
-                partial.data_ptr() as u64,
-                partial.numel() as u64,
-                dq.data_ptr() as u64,
-                dq.numel() as u64 / 2,
-                cuq.data_ptr() as u64,
-                cuq.numel() as u64,
-            ];
-            let mut heads = h as u32;
-            let mut params: Vec<*mut c_void> =
-                buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
-            params.push((&mut heads as *mut u32).cast());
-            params.push((&mut gradient_scale as *mut f32).cast());
-            unsafe {
-                launch_kernel(
-                    rt.bwd_packed_dq_merge_fns
-                        .get(&(bf16, packed_tile_rows as u32))
-                        .unwrap()
-                        .cu_function(),
-                    (
-                        (((max_q + packed_tile_rows - 1) / packed_tile_rows * h).min(65535)) as u32,
-                        batch as u32,
-                        1,
-                    ),
-                    (if packed_tile_rows == 32 { 128 } else { 256 }, 1, 1),
-                    (packed_tile_rows * 128) as u32,
-                    stream.cast(),
-                    &mut params,
-                )
-            }
-            .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed permuted dQ: {e:?}")))?;
-        } else {
-            let mut buffers = [
-                partial.data_ptr() as u64,
-                partial.numel() as u64,
-                dq.data_ptr() as u64,
-                dq.numel() as u64 / 2,
-                dq.numel() as u64 / 2,
-            ];
-            let mut params: Vec<*mut c_void> =
-                buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
-            params.push((&mut q_splits as *mut u32).cast());
-            let mut q_heads = 0u32;
-            params.push((&mut q_heads as *mut u32).cast());
-            params.push((&mut gradient_scale as *mut f32).cast());
-            unsafe {
-                launch_kernel(
-                    rt.bwd_dq_merge_fns.get(&(bf16, 0)).unwrap().cu_function(),
-                    (
-                        (dq.numel() as u64 / 2).div_ceil(256).min(65535) as u32,
-                        1,
-                        1,
-                    ),
-                    (256, 1, 1),
-                    0,
-                    stream.cast(),
-                    &mut params,
-                )
-            }
-            .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed dQ splits: {e:?}")))?;
+        let mut buffers = [
+            partial.data_ptr() as u64,
+            partial.numel() as u64,
+            dq.data_ptr() as u64,
+            dq.numel() as u64 / 2,
+            dq.numel() as u64 / 2,
+        ];
+        let mut params: Vec<*mut c_void> =
+            buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+        params.push((&mut q_splits as *mut u32).cast());
+        params.push((&mut gradient_scale as *mut f32).cast());
+        unsafe {
+            launch_kernel(
+                rt.bwd_dq_merge_fns.get(&bf16).unwrap().cu_function(),
+                (
+                    (dq.numel() as u64 / 2).div_ceil(256).min(65535) as u32,
+                    1,
+                    1,
+                ),
+                (256, 1, 1),
+                0,
+                stream.cast(),
+                &mut params,
+            )
         }
+        .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed dQ splits: {e:?}")))?;
     }
     Function::get_global("ffi.Array")?.call_packed(&[
         AnyView::from(&dq),

@@ -1119,450 +1119,177 @@ impl<
     }
 }
 
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_plain =
-    Generic<false, false, false, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_causal =
-    Generic<false, false, false, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_masked =
-    Generic<false, false, false, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_partial_plain =
-    Generic<false, false, true, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_partial_causal =
-    Generic<false, false, true, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_partial_masked =
-    Generic<false, false, true, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_drop_plain =
-    Generic<false, true, false, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_drop_causal =
-    Generic<false, true, false, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_drop_masked =
-    Generic<false, true, false, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_drop_partial_plain =
-    Generic<false, true, true, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_drop_partial_causal =
-    Generic<false, true, true, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_drop_partial_masked =
-    Generic<false, true, true, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_plain =
-    Generic<true, false, false, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_causal =
-    Generic<true, false, false, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_masked =
-    Generic<true, false, false, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_partial_plain =
-    Generic<true, false, true, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_partial_causal =
-    Generic<true, false, true, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_partial_masked =
-    Generic<true, false, true, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_drop_plain =
-    Generic<true, true, false, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_drop_causal =
-    Generic<true, true, false, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_drop_masked =
-    Generic<true, true, false, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_drop_partial_plain =
-    Generic<true, true, true, 0, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_drop_partial_causal =
-    Generic<true, true, true, 1, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_drop_partial_masked =
-    Generic<true, true, true, 2, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_plain =
-    Generic<false, false, false, 0, 64, 64, 128, 2, true, 4, 4, 4, 2, 4, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_causal =
-    Generic<false, false, false, 1, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_masked =
-    Generic<false, false, false, 2, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_partial_plain =
-    Generic<false, false, true, 0, 64, 64, 128, 2, true, 4, 4, 4, 2, 4, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_partial_causal =
-    Generic<false, false, true, 1, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_partial_masked =
-    Generic<false, false, true, 2, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_drop_plain =
-    Generic<false, true, false, 0, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_drop_causal =
-    Generic<false, true, false, 1, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_drop_masked =
-    Generic<false, true, false, 2, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_drop_partial_plain =
-    Generic<false, true, true, 0, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_drop_partial_causal =
-    Generic<false, true, true, 1, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_f16_drop_partial_masked =
-    Generic<false, true, true, 2, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_plain =
-    Generic<true, false, false, 0, 64, 64, 128, 2, true, 4, 4, 4, 2, 4, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_causal =
-    Generic<true, false, false, 1, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_masked =
-    Generic<true, false, false, 2, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_partial_plain =
-    Generic<true, false, true, 0, 64, 64, 128, 2, true, 4, 4, 4, 2, 4, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_partial_causal =
-    Generic<true, false, true, 1, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_partial_masked =
-    Generic<true, false, true, 2, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_drop_plain =
-    Generic<true, true, false, 0, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_drop_causal =
-    Generic<true, true, false, 1, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_drop_masked =
-    Generic<true, true, false, 2, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_drop_partial_plain =
-    Generic<true, true, true, 0, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_drop_partial_causal =
-    Generic<true, true, true, 1, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d64_bf16_drop_partial_masked =
-    Generic<true, true, true, 2, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_plain =
-    Generic<false, false, false, 0, 96, 32, 64, 1, true, 6, 4, 6, 3, 6, true, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_causal =
-    Generic<false, false, false, 1, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_masked =
-    Generic<false, false, false, 2, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_partial_plain =
-    Generic<false, false, true, 0, 96, 32, 64, 1, true, 6, 4, 6, 3, 6, true, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_partial_causal =
-    Generic<false, false, true, 1, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_partial_masked =
-    Generic<false, false, true, 2, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_drop_plain =
-    Generic<false, true, false, 0, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_drop_causal =
-    Generic<false, true, false, 1, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_drop_masked =
-    Generic<false, true, false, 2, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_drop_partial_plain =
-    Generic<false, true, true, 0, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_drop_partial_causal =
-    Generic<false, true, true, 1, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_f16_drop_partial_masked =
-    Generic<false, true, true, 2, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_plain =
-    Generic<true, false, false, 0, 96, 32, 64, 1, true, 6, 4, 6, 3, 6, true, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_causal =
-    Generic<true, false, false, 1, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_masked =
-    Generic<true, false, false, 2, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_partial_plain =
-    Generic<true, false, true, 0, 96, 32, 64, 1, true, 6, 4, 6, 3, 6, true, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_partial_causal =
-    Generic<true, false, true, 1, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_partial_masked =
-    Generic<true, false, true, 2, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_drop_plain =
-    Generic<true, true, false, 0, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_drop_causal =
-    Generic<true, true, false, 1, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_drop_masked =
-    Generic<true, true, false, 2, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_drop_partial_plain =
-    Generic<true, true, true, 0, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_drop_partial_causal =
-    Generic<true, true, true, 1, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d96_bf16_drop_partial_masked =
-    Generic<true, true, true, 2, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_plain =
-    Generic<false, false, false, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_causal =
-    Generic<false, false, false, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_masked =
-    Generic<false, false, false, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_partial_plain =
-    Generic<false, false, true, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_partial_causal =
-    Generic<false, false, true, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_partial_masked =
-    Generic<false, false, true, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_drop_plain =
-    Generic<false, true, false, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_drop_causal =
-    Generic<false, true, false, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_drop_masked =
-    Generic<false, true, false, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_drop_partial_plain =
-    Generic<false, true, true, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_drop_partial_causal =
-    Generic<false, true, true, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_f16_drop_partial_masked =
-    Generic<false, true, true, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_plain =
-    Generic<true, false, false, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_causal =
-    Generic<true, false, false, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_masked =
-    Generic<true, false, false, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_partial_plain =
-    Generic<true, false, true, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_partial_causal =
-    Generic<true, false, true, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_partial_masked =
-    Generic<true, false, true, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_drop_plain =
-    Generic<true, true, false, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_drop_causal =
-    Generic<true, true, false, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_drop_masked =
-    Generic<true, true, false, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_drop_partial_plain =
-    Generic<true, true, true, 0, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_drop_partial_causal =
-    Generic<true, true, true, 1, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d128_bf16_drop_partial_masked =
-    Generic<true, true, true, 2, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_plain =
-    Generic<false, false, false, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_causal =
-    Generic<false, false, false, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_masked =
-    Generic<false, false, false, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_partial_plain =
-    Generic<false, false, true, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_partial_causal =
-    Generic<false, false, true, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_partial_masked =
-    Generic<false, false, true, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_drop_plain =
-    Generic<false, true, false, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_drop_causal =
-    Generic<false, true, false, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_drop_masked =
-    Generic<false, true, false, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_drop_partial_plain =
-    Generic<false, true, true, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_drop_partial_causal =
-    Generic<false, true, true, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_f16_drop_partial_masked =
-    Generic<false, true, true, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_plain =
-    Generic<true, false, false, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_causal =
-    Generic<true, false, false, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_masked =
-    Generic<true, false, false, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_partial_plain =
-    Generic<true, false, true, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_partial_causal =
-    Generic<true, false, true, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_partial_masked =
-    Generic<true, false, true, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_drop_plain =
-    Generic<true, true, false, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_drop_causal =
-    Generic<true, true, false, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_drop_masked =
-    Generic<true, true, false, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_drop_partial_plain =
-    Generic<true, true, true, 0, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_drop_partial_causal =
-    Generic<true, true, true, 1, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d192_bf16_drop_partial_masked =
-    Generic<true, true, true, 2, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_drop_plain =
-    Generic<false, true, false, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_drop_causal =
-    Generic<false, true, false, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_drop_masked =
-    Generic<false, true, false, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_drop_partial_plain =
-    Generic<false, true, true, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_drop_partial_causal =
-    Generic<false, true, true, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_drop_partial_masked =
-    Generic<false, true, true, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_drop_plain =
-    Generic<true, true, false, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_drop_causal =
-    Generic<true, true, false, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_drop_masked =
-    Generic<true, true, false, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_drop_partial_plain =
-    Generic<true, true, true, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_drop_partial_causal =
-    Generic<true, true, true, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_drop_partial_masked =
-    Generic<true, true, true, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_plain =
-    Generic<false, false, false, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_causal =
-    Generic<false, false, false, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_masked =
-    Generic<false, false, false, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_partial_plain =
-    Generic<false, false, true, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_partial_causal =
-    Generic<false, false, true, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_f16_partial_masked =
-    Generic<false, false, true, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_plain =
-    Generic<true, false, false, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_causal =
-    Generic<true, false, false, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_masked =
-    Generic<true, false, false, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_partial_plain =
-    Generic<true, false, true, 0, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_partial_causal =
-    Generic<true, false, true, 1, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d256_bf16_partial_masked =
-    Generic<true, false, true, 2, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_wide =
-    Generic<false, false, false, 0, 32, 128, 128, 2, true, 2, 8, 2, 2, 2, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_f16_partial_wide =
-    Generic<false, false, true, 0, 32, 128, 128, 2, true, 2, 8, 2, 2, 2, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_wide =
-    Generic<true, false, false, 0, 32, 128, 128, 2, true, 2, 8, 2, 2, 2, false, 8>;
-#[allow(non_camel_case_types)]
-pub type generic_d32_bf16_partial_wide =
-    Generic<true, false, true, 0, 32, 128, 128, 2, true, 2, 8, 2, 2, 2, false, 8>;
+// One alias per tile; `generic_tile` on the host must match these layouts.
+type D32<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+type D32Wide<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 32, 128, 128, 2, true, 2, 8, 2, 2, 2, false, 8>;
+type D64<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+type D64Dropout<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 64, 32, 64, 1, false, 4, 4, 4, 2, 1, false, 4>;
+type D64Plain<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 64, 64, 128, 2, true, 4, 4, 4, 2, 4, true, 8>;
+type D96<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+type D96Dropout<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 96, 32, 64, 1, false, 6, 4, 6, 3, 1, false, 4>;
+type D96Plain<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 96, 32, 64, 1, true, 6, 4, 6, 3, 6, true, 4>;
+type D128<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+type D192<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+type D256<const BF16: bool, const DROP: bool, const PARTIAL: bool, const MODE: u32> =
+    Generic<BF16, DROP, PARTIAL, MODE, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+pub type generic_d32_f16_plain = D32<false, false, false, 0>;
+pub type generic_d32_f16_causal = D32<false, false, false, 1>;
+pub type generic_d32_f16_masked = D32<false, false, false, 2>;
+pub type generic_d32_f16_partial_plain = D32<false, false, true, 0>;
+pub type generic_d32_f16_partial_causal = D32<false, false, true, 1>;
+pub type generic_d32_f16_partial_masked = D32<false, false, true, 2>;
+pub type generic_d32_f16_drop_plain = D32<false, true, false, 0>;
+pub type generic_d32_f16_drop_causal = D32<false, true, false, 1>;
+pub type generic_d32_f16_drop_masked = D32<false, true, false, 2>;
+pub type generic_d32_f16_drop_partial_plain = D32<false, true, true, 0>;
+pub type generic_d32_f16_drop_partial_causal = D32<false, true, true, 1>;
+pub type generic_d32_f16_drop_partial_masked = D32<false, true, true, 2>;
+pub type generic_d32_bf16_plain = D32<true, false, false, 0>;
+pub type generic_d32_bf16_causal = D32<true, false, false, 1>;
+pub type generic_d32_bf16_masked = D32<true, false, false, 2>;
+pub type generic_d32_bf16_partial_plain = D32<true, false, true, 0>;
+pub type generic_d32_bf16_partial_causal = D32<true, false, true, 1>;
+pub type generic_d32_bf16_partial_masked = D32<true, false, true, 2>;
+pub type generic_d32_bf16_drop_plain = D32<true, true, false, 0>;
+pub type generic_d32_bf16_drop_causal = D32<true, true, false, 1>;
+pub type generic_d32_bf16_drop_masked = D32<true, true, false, 2>;
+pub type generic_d32_bf16_drop_partial_plain = D32<true, true, true, 0>;
+pub type generic_d32_bf16_drop_partial_causal = D32<true, true, true, 1>;
+pub type generic_d32_bf16_drop_partial_masked = D32<true, true, true, 2>;
+pub type generic_d64_f16_plain = D64Plain<false, false, false, 0>;
+pub type generic_d64_f16_causal = D64<false, false, false, 1>;
+pub type generic_d64_f16_masked = D64<false, false, false, 2>;
+pub type generic_d64_f16_partial_plain = D64Plain<false, false, true, 0>;
+pub type generic_d64_f16_partial_causal = D64<false, false, true, 1>;
+pub type generic_d64_f16_partial_masked = D64<false, false, true, 2>;
+pub type generic_d64_f16_drop_plain = D64Dropout<false, true, false, 0>;
+pub type generic_d64_f16_drop_causal = D64Dropout<false, true, false, 1>;
+pub type generic_d64_f16_drop_masked = D64Dropout<false, true, false, 2>;
+pub type generic_d64_f16_drop_partial_plain = D64Dropout<false, true, true, 0>;
+pub type generic_d64_f16_drop_partial_causal = D64Dropout<false, true, true, 1>;
+pub type generic_d64_f16_drop_partial_masked = D64Dropout<false, true, true, 2>;
+pub type generic_d64_bf16_plain = D64Plain<true, false, false, 0>;
+pub type generic_d64_bf16_causal = D64<true, false, false, 1>;
+pub type generic_d64_bf16_masked = D64<true, false, false, 2>;
+pub type generic_d64_bf16_partial_plain = D64Plain<true, false, true, 0>;
+pub type generic_d64_bf16_partial_causal = D64<true, false, true, 1>;
+pub type generic_d64_bf16_partial_masked = D64<true, false, true, 2>;
+pub type generic_d64_bf16_drop_plain = D64Dropout<true, true, false, 0>;
+pub type generic_d64_bf16_drop_causal = D64Dropout<true, true, false, 1>;
+pub type generic_d64_bf16_drop_masked = D64Dropout<true, true, false, 2>;
+pub type generic_d64_bf16_drop_partial_plain = D64Dropout<true, true, true, 0>;
+pub type generic_d64_bf16_drop_partial_causal = D64Dropout<true, true, true, 1>;
+pub type generic_d64_bf16_drop_partial_masked = D64Dropout<true, true, true, 2>;
+pub type generic_d96_f16_plain = D96Plain<false, false, false, 0>;
+pub type generic_d96_f16_causal = D96<false, false, false, 1>;
+pub type generic_d96_f16_masked = D96<false, false, false, 2>;
+pub type generic_d96_f16_partial_plain = D96Plain<false, false, true, 0>;
+pub type generic_d96_f16_partial_causal = D96<false, false, true, 1>;
+pub type generic_d96_f16_partial_masked = D96<false, false, true, 2>;
+pub type generic_d96_f16_drop_plain = D96Dropout<false, true, false, 0>;
+pub type generic_d96_f16_drop_causal = D96Dropout<false, true, false, 1>;
+pub type generic_d96_f16_drop_masked = D96Dropout<false, true, false, 2>;
+pub type generic_d96_f16_drop_partial_plain = D96Dropout<false, true, true, 0>;
+pub type generic_d96_f16_drop_partial_causal = D96Dropout<false, true, true, 1>;
+pub type generic_d96_f16_drop_partial_masked = D96Dropout<false, true, true, 2>;
+pub type generic_d96_bf16_plain = D96Plain<true, false, false, 0>;
+pub type generic_d96_bf16_causal = D96<true, false, false, 1>;
+pub type generic_d96_bf16_masked = D96<true, false, false, 2>;
+pub type generic_d96_bf16_partial_plain = D96Plain<true, false, true, 0>;
+pub type generic_d96_bf16_partial_causal = D96<true, false, true, 1>;
+pub type generic_d96_bf16_partial_masked = D96<true, false, true, 2>;
+pub type generic_d96_bf16_drop_plain = D96Dropout<true, true, false, 0>;
+pub type generic_d96_bf16_drop_causal = D96Dropout<true, true, false, 1>;
+pub type generic_d96_bf16_drop_masked = D96Dropout<true, true, false, 2>;
+pub type generic_d96_bf16_drop_partial_plain = D96Dropout<true, true, true, 0>;
+pub type generic_d96_bf16_drop_partial_causal = D96Dropout<true, true, true, 1>;
+pub type generic_d96_bf16_drop_partial_masked = D96Dropout<true, true, true, 2>;
+pub type generic_d128_f16_plain = D128<false, false, false, 0>;
+pub type generic_d128_f16_causal = D128<false, false, false, 1>;
+pub type generic_d128_f16_masked = D128<false, false, false, 2>;
+pub type generic_d128_f16_partial_plain = D128<false, false, true, 0>;
+pub type generic_d128_f16_partial_causal = D128<false, false, true, 1>;
+pub type generic_d128_f16_partial_masked = D128<false, false, true, 2>;
+pub type generic_d128_f16_drop_plain = D128<false, true, false, 0>;
+pub type generic_d128_f16_drop_causal = D128<false, true, false, 1>;
+pub type generic_d128_f16_drop_masked = D128<false, true, false, 2>;
+pub type generic_d128_f16_drop_partial_plain = D128<false, true, true, 0>;
+pub type generic_d128_f16_drop_partial_causal = D128<false, true, true, 1>;
+pub type generic_d128_f16_drop_partial_masked = D128<false, true, true, 2>;
+pub type generic_d128_bf16_plain = D128<true, false, false, 0>;
+pub type generic_d128_bf16_causal = D128<true, false, false, 1>;
+pub type generic_d128_bf16_masked = D128<true, false, false, 2>;
+pub type generic_d128_bf16_partial_plain = D128<true, false, true, 0>;
+pub type generic_d128_bf16_partial_causal = D128<true, false, true, 1>;
+pub type generic_d128_bf16_partial_masked = D128<true, false, true, 2>;
+pub type generic_d128_bf16_drop_plain = D128<true, true, false, 0>;
+pub type generic_d128_bf16_drop_causal = D128<true, true, false, 1>;
+pub type generic_d128_bf16_drop_masked = D128<true, true, false, 2>;
+pub type generic_d128_bf16_drop_partial_plain = D128<true, true, true, 0>;
+pub type generic_d128_bf16_drop_partial_causal = D128<true, true, true, 1>;
+pub type generic_d128_bf16_drop_partial_masked = D128<true, true, true, 2>;
+pub type generic_d192_f16_plain = D192<false, false, false, 0>;
+pub type generic_d192_f16_causal = D192<false, false, false, 1>;
+pub type generic_d192_f16_masked = D192<false, false, false, 2>;
+pub type generic_d192_f16_partial_plain = D192<false, false, true, 0>;
+pub type generic_d192_f16_partial_causal = D192<false, false, true, 1>;
+pub type generic_d192_f16_partial_masked = D192<false, false, true, 2>;
+pub type generic_d192_f16_drop_plain = D192<false, true, false, 0>;
+pub type generic_d192_f16_drop_causal = D192<false, true, false, 1>;
+pub type generic_d192_f16_drop_masked = D192<false, true, false, 2>;
+pub type generic_d192_f16_drop_partial_plain = D192<false, true, true, 0>;
+pub type generic_d192_f16_drop_partial_causal = D192<false, true, true, 1>;
+pub type generic_d192_f16_drop_partial_masked = D192<false, true, true, 2>;
+pub type generic_d192_bf16_plain = D192<true, false, false, 0>;
+pub type generic_d192_bf16_causal = D192<true, false, false, 1>;
+pub type generic_d192_bf16_masked = D192<true, false, false, 2>;
+pub type generic_d192_bf16_partial_plain = D192<true, false, true, 0>;
+pub type generic_d192_bf16_partial_causal = D192<true, false, true, 1>;
+pub type generic_d192_bf16_partial_masked = D192<true, false, true, 2>;
+pub type generic_d192_bf16_drop_plain = D192<true, true, false, 0>;
+pub type generic_d192_bf16_drop_causal = D192<true, true, false, 1>;
+pub type generic_d192_bf16_drop_masked = D192<true, true, false, 2>;
+pub type generic_d192_bf16_drop_partial_plain = D192<true, true, true, 0>;
+pub type generic_d192_bf16_drop_partial_causal = D192<true, true, true, 1>;
+pub type generic_d192_bf16_drop_partial_masked = D192<true, true, true, 2>;
+pub type generic_d256_f16_drop_plain = D256<false, true, false, 0>;
+pub type generic_d256_f16_drop_causal = D256<false, true, false, 1>;
+pub type generic_d256_f16_drop_masked = D256<false, true, false, 2>;
+pub type generic_d256_f16_drop_partial_plain = D256<false, true, true, 0>;
+pub type generic_d256_f16_drop_partial_causal = D256<false, true, true, 1>;
+pub type generic_d256_f16_drop_partial_masked = D256<false, true, true, 2>;
+pub type generic_d256_bf16_drop_plain = D256<true, true, false, 0>;
+pub type generic_d256_bf16_drop_causal = D256<true, true, false, 1>;
+pub type generic_d256_bf16_drop_masked = D256<true, true, false, 2>;
+pub type generic_d256_bf16_drop_partial_plain = D256<true, true, true, 0>;
+pub type generic_d256_bf16_drop_partial_causal = D256<true, true, true, 1>;
+pub type generic_d256_bf16_drop_partial_masked = D256<true, true, true, 2>;
+pub type generic_d256_f16_plain = D256<false, false, false, 0>;
+pub type generic_d256_f16_causal = D256<false, false, false, 1>;
+pub type generic_d256_f16_masked = D256<false, false, false, 2>;
+pub type generic_d256_f16_partial_plain = D256<false, false, true, 0>;
+pub type generic_d256_f16_partial_causal = D256<false, false, true, 1>;
+pub type generic_d256_f16_partial_masked = D256<false, false, true, 2>;
+pub type generic_d256_bf16_plain = D256<true, false, false, 0>;
+pub type generic_d256_bf16_causal = D256<true, false, false, 1>;
+pub type generic_d256_bf16_masked = D256<true, false, false, 2>;
+pub type generic_d256_bf16_partial_plain = D256<true, false, true, 0>;
+pub type generic_d256_bf16_partial_causal = D256<true, false, true, 1>;
+pub type generic_d256_bf16_partial_masked = D256<true, false, true, 2>;
+pub type generic_d32_f16_wide = D32Wide<false, false, false, 0>;
+pub type generic_d32_f16_partial_wide = D32Wide<false, false, true, 0>;
+pub type generic_d32_bf16_wide = D32Wide<true, false, false, 0>;
+pub type generic_d32_bf16_partial_wide = D32Wide<true, false, true, 0>;
 
 pub trait ConvertSpec {
     const BF16: bool;
@@ -1587,41 +1314,23 @@ impl<const BF16: bool, const HD: usize, const BM: usize, const QN: usize, const 
     const BM: usize = BM;
     const QN: usize = QN;
 }
-#[allow(non_camel_case_types)]
 pub type convert_d32_m64w8_f16 = Convert<false, 32, 64, 1, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d32_m64w8_bf16 = Convert<true, 32, 64, 1, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d32_m128w8_f16 = Convert<false, 32, 128, 2, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d32_m128w8_bf16 = Convert<true, 32, 128, 2, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d64_m32w4_f16 = Convert<false, 64, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type convert_d64_m32w4_bf16 = Convert<true, 64, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type convert_d64_m64w8_f16 = Convert<false, 64, 64, 2, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d64_m64w8_bf16 = Convert<true, 64, 64, 2, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d96_m32w4_f16 = Convert<false, 96, 32, 3, 4>;
-#[allow(non_camel_case_types)]
 pub type convert_d96_m32w4_bf16 = Convert<true, 96, 32, 3, 4>;
-#[allow(non_camel_case_types)]
 pub type convert_d96_m64w8_f16 = Convert<false, 96, 64, 3, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d96_m64w8_bf16 = Convert<true, 96, 64, 3, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d128_m64w8_f16 = Convert<false, 128, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d128_m64w8_bf16 = Convert<true, 128, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d192_m32w8_f16 = Convert<false, 192, 32, 3, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d192_m32w8_bf16 = Convert<true, 192, 32, 3, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d256_m64w8_f16 = Convert<false, 256, 64, 8, 8>;
-#[allow(non_camel_case_types)]
 pub type convert_d256_m64w8_bf16 = Convert<true, 256, 64, 8, 8>;
 
 /// Undo the dQ reduction permutation of one BM-row tile at `partial` (row
@@ -1743,14 +1452,8 @@ pub fn generic_dq<S: ConvertSpec>(
 #[kernel(
     convert_d32_m64w8_f16,
     convert_d32_m64w8_bf16,
-    convert_d32_m128w8_f16,
-    convert_d32_m128w8_bf16,
-    convert_d64_m32w4_f16,
-    convert_d64_m32w4_bf16,
     convert_d64_m64w8_f16,
     convert_d64_m64w8_bf16,
-    convert_d96_m32w4_f16,
-    convert_d96_m32w4_bf16,
     convert_d96_m64w8_f16,
     convert_d96_m64w8_bf16,
     convert_d128_m64w8_f16,

@@ -1,5 +1,6 @@
 //! Device side: every `#[kernel]` the host launches by name, plus the shared tile primitives.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+#![allow(non_camel_case_types)]
 
 mod backward;
 mod cache;
