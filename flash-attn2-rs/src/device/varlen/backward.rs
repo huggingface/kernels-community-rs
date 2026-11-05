@@ -665,6 +665,237 @@ pub trait Spec {
         meta: Packed,
     );
 }
+// Compute dK and dV in the same warps so QK/probabilities are evaluated once.
+// Deterministic calls keep dQ separate; the fused variant accumulates it atomically.
+pub struct CombinedDkv<
+    const BF16: bool,
+    const FUSED: bool = false,
+    const CAUSAL: bool = false,
+    const KEY_ROWS: usize = 64,
+    const QUERY_ROWS: usize = 32,
+    const NQT: usize = 4,
+    const PV_CHUNKS: usize = 2,
+    const PADDED: bool = false,
+>;
+impl<
+    const BF16: bool,
+    const FUSED: bool,
+    const CAUSAL: bool,
+    const KEY_ROWS: usize,
+    const QUERY_ROWS: usize,
+    const NQT: usize,
+    const PV_CHUNKS: usize,
+    const PADDED: bool,
+> Spec for CombinedDkv<BF16, FUSED, CAUSAL, KEY_ROWS, QUERY_ROWS, NQT, PV_CHUNKS, PADDED>
+{
+    #[inline(always)]
+    unsafe fn run(
+        q: *const u32,
+        k: *const u32,
+        v: *const u32,
+        dout: *const u32,
+        lse: *const f32,
+        delta: *const f32,
+        dq: *mut u32,
+        dk: *mut u32,
+        dv: *mut u32,
+        alibi: *const f32,
+        mut cfg: FwdConfig,
+        do_strides: Strides,
+        gradient_scale: f32,
+        _dropout: Dropout,
+        meta: Packed,
+    ) {
+        unsafe {
+            let b = thread::blockIdx_z();
+            let seq = meta.sequence(b);
+            if !meta.valid(seq, &cfg) || thread::blockIdx_x() * KEY_ROWS as u32 >= seq.sk {
+                return;
+            }
+            cfg.seqlen_q = seq.sq;
+            cfg.seqlen_k = seq.sk;
+            cfg.tanh_scale = 0.0;
+            cfg.has_alibi = 0;
+            if FUSED {
+                cfg.window_left = -1;
+                cfg.window_right = if CAUSAL { 0 } else { -1 };
+            }
+            let output_stride = (cfg.h / cfg.gqa * cfg.hs_u32) as usize;
+            if FUSED && KEY_ROWS == 256 {
+                if seq.sq % 16 == 0 && seq.sk % 256 == 0 {
+                    crate::device::backward::query_wide_core::<BF16, true>(
+                        q.add(seq.qs as usize * cfg.q.seq as usize),
+                        k.add(seq.ks as usize * cfg.k.seq as usize),
+                        v.add(seq.ks as usize * cfg.v.seq as usize),
+                        dout.add(seq.qs as usize * do_strides.seq as usize),
+                        lse.add(seq.qs as usize),
+                        delta.add(seq.qs as usize + b as usize * 128),
+                        dk.add(seq.ks as usize * output_stride),
+                        dv.add(seq.ks as usize * output_stride),
+                        dq.cast::<f32>().add(
+                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
+                                * cfg.h as usize
+                                * 64,
+                        ),
+                        cfg,
+                        do_strides,
+                        gradient_scale,
+                        Some((meta.total_q, meta.delta_stride)),
+                    );
+                } else {
+                    crate::device::backward::query_wide_core::<BF16, false>(
+                        q.add(seq.qs as usize * cfg.q.seq as usize),
+                        k.add(seq.ks as usize * cfg.k.seq as usize),
+                        v.add(seq.ks as usize * cfg.v.seq as usize),
+                        dout.add(seq.qs as usize * do_strides.seq as usize),
+                        lse.add(seq.qs as usize),
+                        delta.add(seq.qs as usize + b as usize * 128),
+                        dk.add(seq.ks as usize * output_stride),
+                        dv.add(seq.ks as usize * output_stride),
+                        dq.cast::<f32>().add(
+                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
+                                * cfg.h as usize
+                                * 64,
+                        ),
+                        cfg,
+                        do_strides,
+                        gradient_scale,
+                        Some((meta.total_q, meta.delta_stride)),
+                    );
+                }
+                return;
+            }
+            if FUSED && KEY_ROWS == 128 {
+                if seq.sq % 64 == 0 && seq.sk % 128 == 0 {
+                    crate::device::backward::query_core::<BF16, true>(
+                        q.add(seq.qs as usize * cfg.q.seq as usize),
+                        k.add(seq.ks as usize * cfg.k.seq as usize),
+                        v.add(seq.ks as usize * cfg.v.seq as usize),
+                        dout.add(seq.qs as usize * do_strides.seq as usize),
+                        lse.add(seq.qs as usize),
+                        delta.add(seq.qs as usize + b as usize * 128),
+                        dk.add(seq.ks as usize * output_stride),
+                        dv.add(seq.ks as usize * output_stride),
+                        dq.cast::<f32>().add(
+                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
+                                * cfg.h as usize
+                                * 64,
+                        ),
+                        cfg,
+                        do_strides,
+                        gradient_scale,
+                        Some((meta.total_q, meta.delta_stride)),
+                    );
+                } else {
+                    crate::device::backward::query_core::<BF16, false>(
+                        q.add(seq.qs as usize * cfg.q.seq as usize),
+                        k.add(seq.ks as usize * cfg.k.seq as usize),
+                        v.add(seq.ks as usize * cfg.v.seq as usize),
+                        dout.add(seq.qs as usize * do_strides.seq as usize),
+                        lse.add(seq.qs as usize),
+                        delta.add(seq.qs as usize + b as usize * 128),
+                        dk.add(seq.ks as usize * output_stride),
+                        dv.add(seq.ks as usize * output_stride),
+                        dq.cast::<f32>().add(
+                            (seq.qs as usize + b as usize * if KEY_ROWS == 256 { 16 } else { 64 })
+                                * cfg.h as usize
+                                * 64,
+                        ),
+                        cfg,
+                        do_strides,
+                        gradient_scale,
+                        Some((meta.total_q, meta.delta_stride)),
+                    );
+                }
+                return;
+            }
+
+            crate::device::backward::dkv_both_core::<
+                BF16,
+                64,
+                4,
+                8,
+                false,
+                false,
+                false,
+                FUSED,
+                0,
+                32,
+                KEY_ROWS,
+                FUSED,
+                QUERY_ROWS,
+                NQT,
+                PV_CHUNKS,
+                1,
+                PADDED,
+                false,
+            >(
+                q.add(seq.qs as usize * cfg.q.seq as usize),
+                k.add(seq.ks as usize * cfg.k.seq as usize),
+                v.add(seq.ks as usize * cfg.v.seq as usize),
+                dout.add(seq.qs as usize * do_strides.seq as usize),
+                lse.add(seq.qs as usize),
+                delta.add(seq.qs as usize + b as usize * 128),
+                dk.add(seq.ks as usize * output_stride),
+                dv.add(seq.ks as usize * output_stride),
+                if FUSED {
+                    dq.cast::<f32>().add(
+                        (seq.qs as usize + if PADDED { b as usize * 32 } else { 0 })
+                            * cfg.h as usize
+                            * cfg.hs_u32 as usize
+                            * 2,
+                    )
+                } else {
+                    core::ptr::null_mut()
+                },
+                alibi,
+                cfg,
+                do_strides,
+                gradient_scale,
+                Dropout::NONE,
+                Some((meta.total_q, meta.delta_stride)),
+            );
+        }
+    }
+}
+#[allow(non_camel_case_types)]
+pub type dkv_d64_combined = CombinedDkv<false>;
+#[allow(non_camel_case_types)]
+pub type dkv_d64_combined_bf16 = CombinedDkv<true>;
+
+#[allow(non_camel_case_types)]
+pub type fused_d64 = CombinedDkv<false, true, false, 64, 32, 4, 2>;
+#[allow(non_camel_case_types)]
+pub type fused_d64_bf16 = CombinedDkv<true, true, false, 64, 32, 4, 2>;
+#[allow(non_camel_case_types)]
+pub type fused_d64_causal = CombinedDkv<false, true, true, 64, 32, 4, 2>;
+#[allow(non_camel_case_types)]
+pub type fused_d64_causal_bf16 = CombinedDkv<true, true, true, 64, 32, 4, 2>;
+
+#[allow(non_camel_case_types)]
+pub type fused_query_d64 = CombinedDkv<false, true, false, 128, 64, 8, 4>;
+#[allow(non_camel_case_types)]
+pub type fused_query_d64_bf16 = CombinedDkv<true, true, false, 128, 64, 8, 4>;
+
+#[allow(non_camel_case_types)]
+pub type fused_query_d64_causal = CombinedDkv<false, true, true, 128, 64, 8, 4>;
+#[allow(non_camel_case_types)]
+pub type fused_query_d64_causal_bf16 = CombinedDkv<true, true, true, 128, 64, 8, 4>;
+
+#[allow(non_camel_case_types)]
+pub type fused_query_wide_d64 = CombinedDkv<false, true, false, 256, 16, 2, 1>;
+#[allow(non_camel_case_types)]
+pub type fused_query_wide_d64_bf16 = CombinedDkv<true, true, false, 256, 16, 2, 1>;
+
+#[allow(non_camel_case_types)]
+pub type fused_d64_padded = CombinedDkv<false, true, false, 64, 32, 4, 2, true>;
+#[allow(non_camel_case_types)]
+pub type fused_d64_bf16_padded = CombinedDkv<true, true, false, 64, 32, 4, 2, true>;
+#[allow(non_camel_case_types)]
+pub type fused_d64_causal_padded = CombinedDkv<false, true, true, 64, 32, 4, 2, true>;
+#[allow(non_camel_case_types)]
+pub type fused_d64_causal_bf16_padded = CombinedDkv<true, true, true, 64, 32, 4, 2, true>;
+
 pub struct Backward<
     const BF16: bool,
     const HD: usize,
@@ -837,7 +1068,222 @@ pub type dkv_d64_partial_causal_bf16 = Backward<true, 64, 4, 8, true, true, 1, t
 pub type dq_d64_split2_causal = Backward<false, 64, 4, 8, false, false, 2, true>;
 #[allow(non_camel_case_types)]
 pub type dq_d64_split2_causal_bf16 = Backward<true, 64, 4, 8, false, false, 2, true>;
+
+// Head-dimension-generic fused backward for packed MHA without dropout,
+// reusing the dense generic core on per-sequence pointers.
+pub struct GenericPacked<
+    const BF16: bool,
+    const CAUSAL: bool,
+    const HD: usize,
+    const BM: usize,
+    const BN: usize,
+    const SM: usize,
+    const VREG: bool,
+    const KS: usize,
+    const NT: usize,
+    const KVN: usize,
+    const QN: usize,
+    const VK: usize,
+    const DB: bool,
+    const WARPS: usize,
+>;
+impl<
+    const BF16: bool,
+    const CAUSAL: bool,
+    const HD: usize,
+    const BM: usize,
+    const BN: usize,
+    const SM: usize,
+    const VREG: bool,
+    const KS: usize,
+    const NT: usize,
+    const KVN: usize,
+    const QN: usize,
+    const VK: usize,
+    const DB: bool,
+    const WARPS: usize,
+> Spec for GenericPacked<BF16, CAUSAL, HD, BM, BN, SM, VREG, KS, NT, KVN, QN, VK, DB, WARPS>
+{
+    #[inline(always)]
+    unsafe fn run(
+        q: *const u32,
+        k: *const u32,
+        v: *const u32,
+        dout: *const u32,
+        lse: *const f32,
+        delta: *const f32,
+        dq: *mut u32,
+        dk: *mut u32,
+        dv: *mut u32,
+        alibi: *const f32,
+        mut cfg: FwdConfig,
+        do_strides: Strides,
+        gradient_scale: f32,
+        _dropout: Dropout,
+        meta: Packed,
+    ) {
+        unsafe {
+            // Must match the coordinates the core derives.
+            let (key_block, _, b) =
+                crate::device::backward::generic_grid_coords(HD != 256 && CAUSAL);
+            let seq = meta.sequence(b);
+            if !meta.valid(seq, &cfg) || key_block * BN as u32 >= seq.sk {
+                return;
+            }
+            cfg.seqlen_q = seq.sq;
+            cfg.seqlen_k = seq.sk;
+            cfg.tanh_scale = 0.0;
+            cfg.has_alibi = 0;
+            cfg.window_left = -1;
+            cfg.window_right = if CAUSAL { 0 } else { -1 };
+            let output_stride = (cfg.h * cfg.hs_u32) as usize;
+            crate::device::backward::generic_core::<
+                BF16,
+                false,
+                false,
+                HD,
+                BM,
+                BN,
+                SM,
+                VREG,
+                KS,
+                NT,
+                KVN,
+                QN,
+                VK,
+                DB,
+                WARPS,
+            >(
+                q.add(seq.qs as usize * cfg.q.seq as usize),
+                k.add(seq.ks as usize * cfg.k.seq as usize),
+                v.add(seq.ks as usize * cfg.v.seq as usize),
+                dout.add(seq.qs as usize * do_strides.seq as usize),
+                lse.add(seq.qs as usize),
+                delta.add(seq.qs as usize + b as usize * 128),
+                dk.add(seq.ks as usize * output_stride),
+                dv.add(seq.ks as usize * output_stride),
+                dq.cast::<f32>()
+                    .add((seq.qs as usize + b as usize * 128) * cfg.h as usize * HD),
+                alibi,
+                cfg,
+                do_strides,
+                gradient_scale,
+                Dropout::NONE,
+                Some((meta.total_q, meta.delta_stride)),
+            );
+        }
+    }
+}
+#[allow(non_camel_case_types)]
+pub type generic_d32 = GenericPacked<false, false, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d32_causal =
+    GenericPacked<false, true, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d32_bf16 =
+    GenericPacked<true, false, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d32_bf16_causal =
+    GenericPacked<true, true, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d64 = GenericPacked<false, false, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d64_causal =
+    GenericPacked<false, true, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d64_bf16 =
+    GenericPacked<true, false, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d64_bf16_causal =
+    GenericPacked<true, true, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d96 = GenericPacked<false, false, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d96_causal =
+    GenericPacked<false, true, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d96_bf16 =
+    GenericPacked<true, false, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d96_bf16_causal =
+    GenericPacked<true, true, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d128 = GenericPacked<false, false, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d128_causal =
+    GenericPacked<false, true, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d128_bf16 =
+    GenericPacked<true, false, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d128_bf16_causal =
+    GenericPacked<true, true, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d192 =
+    GenericPacked<false, false, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d192_causal =
+    GenericPacked<false, true, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d192_bf16 =
+    GenericPacked<true, false, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d192_bf16_causal =
+    GenericPacked<true, true, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d256 =
+    GenericPacked<false, false, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d256_causal =
+    GenericPacked<false, true, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d256_bf16 =
+    GenericPacked<true, false, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+#[allow(non_camel_case_types)]
+pub type generic_d256_bf16_causal =
+    GenericPacked<true, true, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+
 #[kernel(
+    generic_d32,
+    generic_d32_causal,
+    generic_d32_bf16,
+    generic_d32_bf16_causal,
+    generic_d64,
+    generic_d64_causal,
+    generic_d64_bf16,
+    generic_d64_bf16_causal,
+    generic_d96,
+    generic_d96_causal,
+    generic_d96_bf16,
+    generic_d96_bf16_causal,
+    generic_d128,
+    generic_d128_causal,
+    generic_d128_bf16,
+    generic_d128_bf16_causal,
+    generic_d192,
+    generic_d192_causal,
+    generic_d192_bf16,
+    generic_d192_bf16_causal,
+    generic_d256,
+    generic_d256_causal,
+    generic_d256_bf16,
+    generic_d256_bf16_causal,
+    fused_d64_padded,
+    fused_d64_bf16_padded,
+    fused_d64_causal_padded,
+    fused_d64_causal_bf16_padded,
+    fused_query_wide_d64,
+    fused_query_wide_d64_bf16,
+    fused_query_d64,
+    fused_query_d64_bf16,
+    fused_query_d64_causal,
+    fused_query_d64_causal_bf16,
+    fused_d64,
+    fused_d64_bf16,
+    fused_d64_causal,
+    fused_d64_causal_bf16,
+    dkv_d64_combined,
+    dkv_d64_combined_bf16,
     dq_d64_split2_causal,
     dq_d64_split2_causal_bf16,
     dkv_d64_partial_causal,
@@ -883,7 +1329,7 @@ pub type dq_d64_split2_causal_bf16 = Backward<true, 64, 4, 8, false, false, 2, t
     dq_d256_bf16,
     dkv_d256_bf16
 )]
-#[launch_bounds(128)]
+#[launch_bounds(256)]
 pub fn varlen_backward<S: Spec>(
     q: &[u32],
     k: &[u32],

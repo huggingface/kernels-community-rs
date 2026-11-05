@@ -8,15 +8,15 @@ use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 use crate::host::cuda::{launch_kernel, sys};
 use crate::host::layout::metadata;
 use crate::host::layout::{attention_shape, prepare_packed_qkv, tensor_span};
-use crate::host::runtime::runtime;
+use crate::host::runtime::{generic_smem, generic_tile, runtime};
 use crate::host::tiles::HEAD_DIMS;
 use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
 fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
-    if args.len() != 19 {
+    if args.len() != 19 && args.len() != 20 {
         return Err(err(
             VALUE_ERROR,
-            "varlen_bwd expects q,k,v,dout,out,lse,cuq,cuk,alibi,scale,causal,left,right,cap,dropout,state,max_q,max_k,zero_tensors",
+            "varlen_bwd expects q,k,v,dout,out,lse,cuq,cuk,alibi,scale,causal,left,right,cap,dropout,state,max_q,max_k,zero_tensors[,deterministic]",
         ));
     }
     let (q, bf16, qs) = prepare_packed_qkv("q", arg(args, 0, "q")?)?;
@@ -38,6 +38,12 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     let max_q: i64 = arg(args, 16, "max_q")?;
     let max_k: i64 = arg(args, 17, "max_k")?;
     let zero_tensors: bool = arg(args, 18, "zero_tensors")?;
+    // Preserve deterministic behavior for callers of the original explicit ABI.
+    let deterministic: bool = if args.len() == 20 {
+        arg(args, 19, "deterministic")?
+    } else {
+        true
+    };
     let [one, total_q, h, d] = attention_shape(&q);
     let k_shape = attention_shape(&k);
     let total_k = k_shape[1];
@@ -181,6 +187,59 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
         .bind_to_thread()
         .map_err(|e| err(RUNTIME_ERROR, &format!("bind packed backward: {e:?}")))?;
     let stream = unsafe { TVMFFIEnvGetStream(DLDeviceType::kDLCUDA as i32, device.device_id) };
+    let combined_kv = rt.sm89
+        && d == 64
+        && h == hk
+        && p == 0.0
+        && cap <= 0.0
+        && alibi.is_none()
+        && (128..=4096).contains(&max_q)
+        && (128..=4096).contains(&max_k)
+        && ((left < 0 && right < 0) || (left >= max_k && right == 0));
+    // MHA without dropout uses the generic fused kernel for non-D64 heads.
+    let generic = rt.sm89
+        && matches!(d, 32 | 64 | 96 | 128 | 192 | 256)
+        && h == hk
+        && p == 0.0
+        && cap <= 0.0
+        && alibi.is_none()
+        && !deterministic
+        && max_q > 0
+        && max_k > 0
+        && total_q > 0
+        && total_k > 0
+        && ((left < 0 && right < 0) || (left >= max_k && right == 0));
+    let fused = !generic
+        && combined_kv
+        && !deterministic
+        && total_q
+            .checked_mul(h)
+            .and_then(|n| n.checked_mul(d))
+            .and_then(|n| n.checked_mul(4))
+            .is_some_and(|bytes| bytes <= rt.l2_bytes / 2);
+    // Wider tiles amortize dQ atomics when long sequences fill the GPU.
+    let fused_query = fused
+        && max_q >= 1024
+        && max_k >= 1024
+        && total_q >= batch * 512
+        && total_k >= batch * 512
+        && batch * h * ((max_k + 127) / 128) >= rt.sm_count;
+    let wide_blocks = batch * h * ((max_k + 255) / 256);
+    let narrow_blocks = batch * h * ((max_k + 127) / 128);
+    let wide_waves = (wide_blocks + rt.sm_count - 1) / rt.sm_count;
+    let narrow_waves = (narrow_blocks + rt.sm_count - 1) / rt.sm_count;
+    let fused_query_wide =
+        fused_query && !alibi_causal && max_q >= 2048 && 2 * wide_waves <= narrow_waves;
+    // Query kernels and short packed sequences use padded accumulators.
+    // Other inputs retain their existing staging schedule.
+    let packed_permuted = fused && (fused_query || max_q <= 512);
+    let packed_tile_rows = if fused_query_wide {
+        16
+    } else if fused_query {
+        64
+    } else {
+        32
+    };
     // Expand underfilled GQA grids; FP32 partials bounded to half of L2.
     let partial_bytes = total_k
         .checked_mul(h)
@@ -228,16 +287,33 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     } else {
         1u32
     };
-    let q_partials = if q_splits > 1 {
+    if fused || generic {
+        q_splits = 1;
+    }
+    let q_partials = if q_splits > 1 || fused || generic {
         Some(alloc_tensor(
-            &[q_splits as i64, total_q, h, d],
+            &[
+                q_splits as i64,
+                total_q
+                    + if generic {
+                        128 * batch
+                    } else if packed_permuted {
+                        batch * packed_tile_rows
+                    } else {
+                        0
+                    },
+                h,
+                d,
+            ],
             float32,
             device,
         )?)
     } else {
         None
     };
-    if zero_tensors && let Some(partial) = &q_partials {
+    if (zero_tensors || fused || generic)
+        && let Some(partial) = &q_partials
+    {
         unsafe {
             sys::cuMemsetD8Async(
                 partial.data_ptr() as u64,
@@ -275,6 +351,8 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
         // Merges overwrite every element; only partials need zeroing.
         let targets: &[&Tensor] = match (q_partials.is_some(), parallel_gqa) {
             (true, true) => &[&delta],
+            // The generic kernel writes every dK/dV row, padding included.
+            (true, false) if generic => &[&delta],
             (true, false) => &[&dk, &dv, &delta],
             (false, true) => &[&dq, &delta],
             (false, false) => &[&dq, &dk, &dv, &delta],
@@ -345,6 +423,115 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
             )
         })?;
     }
+    if generic {
+        let partial = q_partials.as_ref().unwrap();
+        let mut buffers = Vec::<u64>::new();
+        for t in [&q, &k, &v, &dout] {
+            buffers.extend([t.data_ptr() as u64, tensor_span(t) / 2]);
+        }
+        for t in [&lse, &delta] {
+            buffers.extend([t.data_ptr() as u64, t.numel() as u64]);
+        }
+        buffers.extend([partial.data_ptr() as u64, partial.numel() as u64]);
+        for t in [&dk, &dv] {
+            buffers.extend([t.data_ptr() as u64, t.numel() as u64 / 2]);
+        }
+        buffers.extend(EMPTY_SLICE);
+        buffers.extend(EMPTY_SLICE);
+        for t in [&cuq, &cuk] {
+            buffers.extend([t.data_ptr() as u64, t.numel() as u64]);
+        }
+        let mut params: Vec<*mut c_void> =
+            buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+        params.push((&mut score_scale as *mut f32).cast());
+        params.push((&mut tanh_scale as *mut f32).cast());
+        let mut config = [
+            left as u32,
+            right as u32,
+            max_q as u32,
+            max_k as u32,
+            0,
+            alibi_causal as u32,
+            h as u32,
+            1,
+            (d / 2) as u32,
+            qs.seq,
+            qs.head,
+            ks.seq,
+            ks.head,
+            vs.seq,
+            vs.head,
+            0,
+            ds.seq,
+            ds.head,
+            total_q as u32,
+            total_k as u32,
+            delta_stride as u32,
+        ];
+        for x in &mut config {
+            params.push((x as *mut u32).cast());
+        }
+        params.push((&mut gradient_scale as *mut f32).cast());
+        params.push((&mut keep as *mut f32).cast());
+        let layout = generic_tile(d, false, false, true);
+        let (rows, key_rows) = (layout.rows, layout.keys);
+        unsafe {
+            launch_kernel(
+                rt.varlen_generic_fns
+                    .get(&(d, bf16, alibi_causal))
+                    .unwrap()
+                    .cu_function(),
+                (
+                    ((max_k + key_rows - 1) / key_rows) as u32,
+                    h as u32,
+                    batch as u32,
+                ),
+                (layout.warps * 32, 1, 1),
+                generic_smem(d, layout),
+                stream.cast(),
+                &mut params,
+            )
+        }
+        .map_err(|e| {
+            err(
+                RUNTIME_ERROR,
+                &format!("launch packed generic backward: {e:?}"),
+            )
+        })?;
+        let mut buffers = [
+            partial.data_ptr() as u64,
+            partial.numel() as u64,
+            dq.data_ptr() as u64,
+            dq.numel() as u64 / 2,
+            cuq.data_ptr() as u64,
+            cuq.numel() as u64,
+        ];
+        let mut heads = h as u32;
+        let mut params: Vec<*mut c_void> =
+            buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+        params.push((&mut heads as *mut u32).cast());
+        params.push((&mut gradient_scale as *mut f32).cast());
+        unsafe {
+            launch_kernel(
+                rt.varlen_generic_dq_fns
+                    .get(&(d, bf16))
+                    .unwrap()
+                    .cu_function(),
+                (((max_q + rows - 1) / rows) as u32, h as u32, batch as u32),
+                (layout.warps * 32, 1, 1),
+                (rows * (d + 4) * 4) as u32,
+                stream.cast(),
+                &mut params,
+            )
+        }
+        .map_err(|e| err(RUNTIME_ERROR, &format!("convert packed generic dQ: {e:?}")))?;
+        return Function::get_global("ffi.Array")?.call_packed(&[
+            AnyView::from(&dq),
+            AnyView::from(&dk),
+            AnyView::from(&dv),
+            AnyView::from(&delta),
+        ]);
+    }
     let bucket = *HEAD_DIMS.iter().find(|&&bucket| bucket >= d).unwrap();
     let mut buffers = Vec::<u64>::new();
     for t in [&q, &k, &v, &dout] {
@@ -409,15 +596,38 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
     params.push((&mut gradient_scale as *mut f32).cast());
     params.push((&mut keep as *mut f32).cast());
     for kv in [false, true] {
+        if fused && !kv {
+            continue;
+        }
         let seq = if kv { max_k } else { max_q };
         let total = if kv { total_k } else { total_q };
         if seq == 0 || total == 0 || max_q == 0 || total_q == 0 {
             continue;
         }
-        let rows = if kv { 32 } else { 64 };
+        let rows = if fused_query_wide {
+            256
+        } else if fused_query {
+            128
+        } else if kv && !combined_kv {
+            32
+        } else {
+            64
+        };
         unsafe {
             launch_kernel(
-                if d == 64
+                if fused_query {
+                    rt.varlen_fused_query_fns
+                        .get(&(bf16, fused_query_wide, alibi_causal))
+                        .unwrap()
+                        .cu_function()
+                } else if fused {
+                    rt.varlen_fused_fns
+                        .get(&(bf16, alibi_causal, packed_permuted))
+                        .unwrap()
+                        .cu_function()
+                } else if kv && combined_kv {
+                    rt.varlen_dkv_combined_fns.get(&bf16).unwrap().cu_function()
+                } else if d == 64
                     && cap <= 0.0
                     && alibi.is_none()
                     && alibi_causal
@@ -448,8 +658,18 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
                     (if kv && !parallel_gqa { hk } else { h }) as u32,
                     batch as u32,
                 ),
-                (128, 1, 1),
-                ((if kv { 128 } else { 192 }) * (bucket / 2 + 4) * 4) as u32,
+                (if fused_query { 256 } else { 128 }, 1, 1),
+                if fused_query_wide {
+                    90112
+                } else if fused_query {
+                    98304
+                } else if fused {
+                    34816
+                } else if kv && combined_kv {
+                    25600
+                } else {
+                    ((if kv { 128 } else { 192 }) * (bucket / 2 + 4) * 4) as u32
+                },
                 stream.cast(),
                 &mut params,
             )
@@ -490,32 +710,68 @@ fn varlen_bwd(args: &[AnyView]) -> Result<Any> {
         .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed GQA gradients: {e:?}")))?;
     }
     if let Some(partial) = &q_partials {
-        let mut buffers = [
-            partial.data_ptr() as u64,
-            partial.numel() as u64,
-            dq.data_ptr() as u64,
-            dq.numel() as u64 / 2,
-            dq.numel() as u64 / 2,
-        ];
-        let mut params: Vec<*mut c_void> =
-            buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
-        params.push((&mut q_splits as *mut u32).cast());
-        params.push((&mut gradient_scale as *mut f32).cast());
-        unsafe {
-            launch_kernel(
-                rt.bwd_dq_merge_fns.get(&bf16).unwrap().cu_function(),
-                (
-                    (dq.numel() as u64 / 2).div_ceil(256).min(65535) as u32,
-                    1,
-                    1,
-                ),
-                (256, 1, 1),
-                0,
-                stream.cast(),
-                &mut params,
-            )
+        if packed_permuted {
+            let mut buffers = [
+                partial.data_ptr() as u64,
+                partial.numel() as u64,
+                dq.data_ptr() as u64,
+                dq.numel() as u64 / 2,
+                cuq.data_ptr() as u64,
+                cuq.numel() as u64,
+            ];
+            let mut heads = h as u32;
+            let mut params: Vec<*mut c_void> =
+                buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+            params.push((&mut heads as *mut u32).cast());
+            params.push((&mut gradient_scale as *mut f32).cast());
+            unsafe {
+                launch_kernel(
+                    rt.bwd_packed_dq_merge_fns
+                        .get(&(bf16, packed_tile_rows as u32))
+                        .unwrap()
+                        .cu_function(),
+                    (
+                        (((max_q + packed_tile_rows - 1) / packed_tile_rows * h).min(65535)) as u32,
+                        batch as u32,
+                        1,
+                    ),
+                    (if packed_tile_rows == 32 { 128 } else { 256 }, 1, 1),
+                    (packed_tile_rows * 128) as u32,
+                    stream.cast(),
+                    &mut params,
+                )
+            }
+            .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed permuted dQ: {e:?}")))?;
+        } else {
+            let mut buffers = [
+                partial.data_ptr() as u64,
+                partial.numel() as u64,
+                dq.data_ptr() as u64,
+                dq.numel() as u64 / 2,
+                dq.numel() as u64 / 2,
+            ];
+            let mut params: Vec<*mut c_void> =
+                buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+            params.push((&mut q_splits as *mut u32).cast());
+            let mut q_heads = 0u32;
+            params.push((&mut q_heads as *mut u32).cast());
+            params.push((&mut gradient_scale as *mut f32).cast());
+            unsafe {
+                launch_kernel(
+                    rt.bwd_dq_merge_fns.get(&(bf16, 0)).unwrap().cu_function(),
+                    (
+                        (dq.numel() as u64 / 2).div_ceil(256).min(65535) as u32,
+                        1,
+                        1,
+                    ),
+                    (256, 1, 1),
+                    0,
+                    stream.cast(),
+                    &mut params,
+                )
+            }
+            .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed dQ splits: {e:?}")))?;
         }
-        .map_err(|e| err(RUNTIME_ERROR, &format!("merge packed dQ splits: {e:?}")))?;
     }
     Function::get_global("ffi.Array")?.call_packed(&[
         AnyView::from(&dq),

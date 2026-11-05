@@ -1006,28 +1006,17 @@ def bwd(
         rng_state = reserve_rng_state(q, gen)
     if p == 0:
         rng_state = None
-    delta = ops.bwd_preprocess(dout, out, p)
-    args = (
-        q,
-        k,
-        v,
-        dout,
-        softmax_lse,
-        delta,
-        alibi_slopes,
-        scale,
-        bool(is_causal),
-        left,
-        right,
-        cap,
-        p,
-        rng_state,
-    )
+    tail = (alibi_slopes, scale, bool(is_causal), left, right, cap, p, rng_state)
     if deterministic:
+        delta = ops.bwd_preprocess(dout, out, p)
+        args = (q, k, v, dout, softmax_lse, delta, *tail)
         grad_q = ops.bwd_dq(*args)
-        grad_k, grad_v = _torch_tensors(ops.bwd_dkv(*args))
+        grad_k, grad_v = _torch_tensors(ops.bwd_dkv(*args), 2)
     else:
-        grad_q, grad_k, grad_v = _torch_tensors(ops.bwd_all(*args))
+        # Computes delta in the same call, clearing the dQ accumulator with it.
+        grad_q, grad_k, grad_v, delta = _torch_tensors(
+            ops.bwd_all_preprocess(q, k, v, dout, softmax_lse, out, *tail), 4
+        )
     gradients = _finish_gradients((grad_q, grad_k, grad_v), (dq, dk, dv), (q, k, v))
     return [*gradients, delta]
 
@@ -1488,8 +1477,9 @@ def varlen_bwd(
         max_q,
         max_k,
         bool(zero_tensors),
+        deterministic,
     )
-    grad_q, grad_k, grad_v, softmax_d = _torch_tensors(values)
+    grad_q, grad_k, grad_v, softmax_d = _torch_tensors(values, 4)
     gradients = _finish_gradients((grad_q, grad_k, grad_v), (dq, dk, dv), (q, k, v))
     return [*gradients, softmax_d]
 
