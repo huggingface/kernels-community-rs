@@ -3,6 +3,7 @@
 
 mod dense;
 mod dense192;
+mod resident;
 
 use crate::device::config::{FwdConfig, KvRange, LaunchTile, TensorBases};
 use crate::device::dropout::Dropout;
@@ -23,7 +24,10 @@ const LN_2: f32 = core::f32::consts::LN_2;
 
 const SMEM_PAD_U32: usize = 4;
 
-const SMEM_BUDGET: usize = 101_376;
+pub const SMEM_BUDGET: usize = 101_376;
+
+// Two blocks per SM including the 1 KB reserved per block.
+pub const QSMEM_PAIR_BUDGET: usize = 49_152;
 
 #[derive(Clone, Copy)]
 pub struct SmemLayout {
@@ -61,20 +65,120 @@ pub struct SmemBuffers {
     pub v0: *mut u32,
     pub k1: *mut u32,
     pub v1: *mut u32,
+    /// Resident Q tile (Q_SMEM kernels); otherwise aliases k0 for staging.
+    pub q: *mut u32,
 }
 
 impl SmemBuffers {
     pub unsafe fn new(layout: SmemLayout) -> Self {
+        unsafe { Self::with_q_region(layout, false) }
+    }
+
+    pub unsafe fn with_q_region(layout: SmemLayout, q_region: bool) -> Self {
         let v0_off = if layout.double || layout.triple {
             2 * layout.tile_bytes
         } else {
             layout.tile_bytes
+        };
+        let buffers = if layout.double {
+            4
+        } else if layout.triple {
+            3
+        } else {
+            2
         };
         Self {
             k0: DynamicSharedArray::<u32, 16>::get() as usize as *mut u32,
             v0: DynamicSharedArray::<u32, 16>::offset(v0_off),
             k1: DynamicSharedArray::<u32, 16>::offset(layout.tile_bytes),
             v1: DynamicSharedArray::<u32, 16>::offset(3 * layout.tile_bytes),
+            q: DynamicSharedArray::<u32, 16>::offset(if q_region {
+                buffers * layout.tile_bytes
+            } else {
+                0
+            }),
+        }
+    }
+}
+
+/// Stage the Q tile into its resident shared-memory region (Q_SMEM kernels).
+#[inline(always)]
+pub unsafe fn stage_q_tile<const BLOCK_ROWS: u32, const THREADS: u32>(
+    q: *const u32,
+    dst: *mut u32,
+    cfg: &FwdConfig,
+    tile: &LaunchTile,
+    bases: &TensorBases,
+    layout: SmemLayout,
+) {
+    unsafe {
+        let mut i = tile.tid as usize;
+        while i < BLOCK_ROWS as usize * layout.d_u32 {
+            let row = i / layout.d_u32;
+            let col = i % layout.d_u32;
+            let qrow = tile.q_row_base as usize + row;
+            let val = if qrow < cfg.seqlen_q as usize && col < cfg.hs_u32 as usize {
+                *q.add(bases.q + qrow * cfg.q.seq as usize + col)
+            } else {
+                0
+            };
+            *dst.add(row * layout.stride + col) = val;
+            i += THREADS as usize;
+        }
+        thread::sync_threads();
+    }
+}
+
+/// QK^T with the A fragments read from the resident Q tile per k-step.
+#[inline(always)]
+pub unsafe fn compute_qk_qsmem<
+    const BF16: bool,
+    const RFRAGS: usize,
+    const NFQ: usize,
+    const NKT: usize,
+>(
+    s: &mut [[f32; 4]],
+    q_smem_base: *const u32,
+    k_smem_base: *const u32,
+    tile: &LaunchTile,
+    layout: SmemLayout,
+) {
+    unsafe {
+        let a_row = (tile.warp_row + (tile.lane_id & 7) + ((tile.lane_id >> 3) & 1) * 8) as usize;
+        let a_col_half = ((tile.lane_id >> 4) as usize) * 4;
+        let q_addr = shared_address(q_smem_base);
+        let k_addr = shared_address(k_smem_base);
+        let l16 = (tile.lane_id & 15) as usize;
+        let mut kc = 0usize;
+        while kc < NFQ {
+            cuda_device::thread::__unroll_config::<0>();
+            let mut a = [[0u32; 4]; RFRAGS];
+            let mut rf = 0usize;
+            while rf < RFRAGS {
+                cuda_device::thread::__unroll_config::<0>();
+                let row = a_row + rf * 16;
+                a[rf] = ldmatrix_x4_shared(
+                    q_addr + ((row * layout.stride + kc * 8 + a_col_half) * 4) as u32,
+                );
+                rf += 1;
+            }
+            let mut nt = 0usize;
+            while nt < NKT {
+                cuda_device::thread::__unroll_config::<0>();
+                let b_row = nt * 8 + (l16 & 7) + ((tile.lane_id >> 4) * 8) as usize;
+                let b_col_u32 = kc * 8 + (l16 >> 3) * 4;
+                let b =
+                    ldmatrix_x4_shared(k_addr + ((b_row * layout.stride + b_col_u32) * 4) as u32);
+                let mut rf = 0usize;
+                while rf < RFRAGS {
+                    cuda_device::thread::__unroll_config::<0>();
+                    s[rf * NKT + nt] = mma::<BF16>(s[rf * NKT + nt], a[rf], [b[0], b[1]]);
+                    s[rf * NKT + nt + 1] = mma::<BF16>(s[rf * NKT + nt + 1], a[rf], [b[2], b[3]]);
+                    rf += 1;
+                }
+                nt += 2;
+            }
+            kc += 1;
         }
     }
 }
@@ -396,7 +500,11 @@ pub unsafe fn compute_qk<
 ) {
     unsafe {
         // Literal steps: dynamic fragment indices stay in local memory.
-        if NFQ != 2 && NFQ != 12 && !(NFQ == 16 && NKT == 2) {
+        if NFQ != 2
+            && NFQ != 12
+            && !(NFQ == 16 && NKT == 2)
+            && !(NFQ == 4 && RFRAGS == 2 && NKT == 4)
+        {
             compute_qk_single::<BF16, RFRAGS, NFQ, NKT>(s, q_frag, k_smem_base, tile, layout);
             return;
         }
@@ -715,7 +823,11 @@ pub unsafe fn accumulate_values<
     layout: SmemLayout,
 ) {
     unsafe {
-        if NFO != 4 && NFO != 24 && !(NFO == 32 && NKT == 2) {
+        if NFO != 4
+            && NFO != 24
+            && !(NFO == 32 && NKT == 2)
+            && !(NFO == 8 && RFRAGS == 2 && NKT == 4)
+        {
             accumulate_values_single::<BF16, RFRAGS, NKT, NFO, PV_CHUNKS>(
                 o_acc,
                 p_pack,
@@ -725,6 +837,31 @@ pub unsafe fn accumulate_values<
             );
             return;
         }
+        accumulate_values_paired::<BF16, RFRAGS, NKT, NFO, PV_CHUNKS>(
+            o_acc,
+            p_pack,
+            v_smem_base,
+            tile,
+            layout,
+        );
+    }
+}
+
+#[inline(always)]
+pub unsafe fn accumulate_values_paired<
+    const BF16: bool,
+    const RFRAGS: usize,
+    const NKT: usize,
+    const NFO: usize,
+    const PV_CHUNKS: usize,
+>(
+    o_acc: &mut [[f32; 4]],
+    p_pack: &[[u32; 2]],
+    v_smem_base: *const u32,
+    tile: &LaunchTile,
+    layout: SmemLayout,
+) {
+    unsafe {
         let v_addr = shared_address(v_smem_base);
         let mut kc = 0usize;
         while kc < PV_CHUNKS {
@@ -775,6 +912,7 @@ pub unsafe fn write_output<
     scratch: *mut u32,
     layout: SmemLayout,
     output_scale: f32,
+    lse_base: usize,
 ) {
     unsafe {
         // Small heads and local windows store directly.
@@ -844,7 +982,6 @@ pub unsafe fn write_output<
             }
 
             if tile.pair == 0 {
-                let lse_base = tile.bh as usize * cfg.seqlen_q as usize;
                 let lse0 = if l0 > 0.0 {
                     (m_row[rf * 2] + lg2_approx(l0)) * LN_2
                 } else {
@@ -1044,8 +1181,9 @@ pub fn online_softmax_pack_raw<
         cuda_device::thread::__unroll_config::<0>();
         let m_new0;
         let m_new1;
-        // Balanced reduction only helps wide-head dense kernels.
-        if NFO == 32 && NKT == 4 {
+        // Shorten the max dependency chain for wide dense heads and
+        // the 128-key D128 cache tile.
+        if (NFO == 32 && NKT == 4) || (NFO == 16 && NKT == 16) {
             let mut maxima = [[f32::NEG_INFINITY; 2]; NKT];
             let mut nt = 0usize;
             while nt < NKT {
@@ -1111,7 +1249,9 @@ pub fn online_softmax_pack_raw<
         m_row[rf * 2] = m_new0;
         m_row[rf * 2 + 1] = m_new1;
 
-        if alpha0 != 1.0 || alpha1 != 1.0 {
+        // Dense D192 and wide D128 cache tiles benefit from scheduling the
+        // output rescale without a data-dependent branch.
+        if (NFO == 24 && NKT == 8) || (NFO == 16 && NKT == 16) || alpha0 != 1.0 || alpha1 != 1.0 {
             let mut d = 0usize;
             while d < NFO {
                 cuda_device::thread::__unroll_config::<0>();
@@ -1182,6 +1322,7 @@ pub unsafe fn flash_attn_core<
     const RECURRENT_COPY: bool,
     const RAW_SCORES: bool,
     const DROPOUT: bool,
+    const Q_SMEM: bool,
 >(
     q: *const u32,
     k: *const u32,
@@ -1219,7 +1360,13 @@ pub unsafe fn flash_attn_core<
             // Narrow split tiles overlap next K without doubling the V storage.
             layout.triple = HD == 32 && BLOCK_ROWS >= 32;
         }
-        let smem = SmemBuffers::new(layout);
+        if Q_SMEM {
+            // Resident Q plus K/V buffers must leave room for two blocks per SM.
+            let q_bytes = BLOCK_ROWS as usize * layout.stride * 4;
+            layout.double = 4 * layout.tile_bytes + q_bytes <= QSMEM_PAIR_BUDGET;
+            layout.triple = !layout.double && 3 * layout.tile_bytes + q_bytes <= QSMEM_PAIR_BUDGET;
+        }
+        let smem = SmemBuffers::with_q_region(layout, Q_SMEM);
 
         let cfg = FwdConfig::new(
             scale,
@@ -1262,9 +1409,14 @@ pub unsafe fn flash_attn_core<
         let tanh_scale = cfg.tanh_scale;
         let slope = slope * LOG2_E;
 
-        let q_frag = load_q_frag::<Q_FRAGS, RFRAGS, NFQ, BLOCK_ROWS, THREADS>(
-            q, smem.k0, &cfg, &tile, &bases, layout,
-        );
+        let q_frag = if Q_SMEM {
+            stage_q_tile::<BLOCK_ROWS, THREADS>(q, smem.q, &cfg, &tile, &bases, layout);
+            [[0u32; 4]; Q_FRAGS]
+        } else {
+            load_q_frag::<Q_FRAGS, RFRAGS, NFQ, BLOCK_ROWS, THREADS>(
+                q, smem.k0, &cfg, &tile, &bases, layout,
+            )
+        };
 
         let mut o_acc = [[0.0f32; 4]; O_FRAGS];
         let mut m_row = [f32::NEG_INFINITY; ROWS];
@@ -1295,7 +1447,17 @@ pub unsafe fn flash_attn_core<
                     k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse,
                 );
             let mut s = [[0.0f32; 4]; S_FRAGS];
-            compute_qk::<BF16, RFRAGS, NFQ, NKT>(&mut s, &q_frag, k_smem_base, &tile, layout);
+            if Q_SMEM {
+                compute_qk_qsmem::<BF16, RFRAGS, NFQ, NKT>(
+                    &mut s,
+                    smem.q,
+                    k_smem_base,
+                    &tile,
+                    layout,
+                );
+            } else {
+                compute_qk::<BF16, RFRAGS, NFQ, NKT>(&mut s, &q_frag, k_smem_base, &tile, layout);
+            }
             if !layout.double && !layout.triple {
                 // d64: one barrier finishes V staging and releases K.
                 if HD == 64 {
@@ -1402,6 +1564,7 @@ pub unsafe fn flash_attn_core<
             smem.k0,
             layout,
             if DROPOUT { dropout.inv_keep } else { 1.0 },
+            tile.bh as usize * cfg.seqlen_q as usize,
         );
     }
 }

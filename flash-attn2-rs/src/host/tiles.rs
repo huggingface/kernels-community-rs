@@ -35,6 +35,65 @@ pub(super) fn dropout_tile(bucket: i64) -> Tile {
     }
 }
 
+// v2's split-KV key tiles for the unsplit decode kernels over exact head dims.
+pub(super) fn wide_tile(bucket: i64) -> Tile {
+    Tile {
+        rows: 64,
+        threads: 128,
+        keys: if bucket <= 64 {
+            256
+        } else if bucket <= 128 {
+            128
+        } else {
+            64
+        },
+        alternate: false,
+    }
+}
+
+// Resident-Q tiles: K/V buffers plus the Q tile, two blocks per SM when possible.
+pub(super) fn qsmem_smem_bytes(bucket: i64, keys: usize) -> u32 {
+    const PAIR_BUDGET: usize = 49_152;
+    let stride = (bucket / 2) as usize + SMEM_PAD_U32;
+    let tile_bytes = keys * stride * 4;
+    let q_bytes = 128 * stride * 4;
+    let buffers = if 4 * tile_bytes + q_bytes <= PAIR_BUDGET {
+        4
+    } else if 3 * tile_bytes + q_bytes <= PAIR_BUDGET {
+        3
+    } else {
+        2
+    };
+    (buffers * tile_bytes + q_bytes) as u32
+}
+
+// Unsplit decode double-buffers K when three tiles fit (device WIDE layout).
+pub(super) fn wide_smem_bytes(bucket: i64) -> u32 {
+    let tile = wide_tile(bucket);
+    let stride = (bucket / 2) as usize + SMEM_PAD_U32;
+    let tile_bytes = tile.keys * stride * 4;
+    let plain = flash_smem_bytes(bucket, tile) as usize;
+    if plain == 2 * tile_bytes && 3 * tile_bytes <= SMEM_BUDGET {
+        (3 * tile_bytes) as u32
+    } else {
+        plain as u32
+    }
+}
+
+// Causal prefill over 256-row pages; d64 already reached parity at 64 keys.
+pub(super) fn paged_causal_tile(bucket: i64) -> Tile {
+    Tile {
+        rows: 64,
+        threads: 128,
+        keys: if matches!(bucket, 64 | 192 | 256) {
+            64
+        } else {
+            128
+        },
+        alternate: false,
+    }
+}
+
 pub(super) fn split_tile(bucket: i64, rows: i64) -> Tile {
     Tile {
         rows,

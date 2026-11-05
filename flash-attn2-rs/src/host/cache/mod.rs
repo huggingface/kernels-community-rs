@@ -32,6 +32,37 @@ fn tensor(name: &str, t: &Tensor, q: &Tensor, writable: bool) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn prepare_fused_append(
+    q: &Tensor,
+    kc: &Tensor,
+    vc: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    lengths: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    tensor("kcache", kc, q, true)?;
+    tensor("vcache", vc, q, true)?;
+    if !disjoint_views(kc, vc)
+        || !disjoint_auxiliary(lengths, kc)
+        || !disjoint_auxiliary(lengths, vc)
+    {
+        return Err(err(
+            VALUE_ERROR,
+            "fused append requires disjoint metadata and writable caches",
+        ));
+    }
+    let snapshot = |source: &Tensor| -> Result<Tensor> {
+        if !disjoint_views(source, kc) || !disjoint_views(source, vc) {
+            let saved = alloc_tensor(source.shape(), source.dtype(), source.device())?;
+            copy_layout(source, &saved)?;
+            Ok(saved)
+        } else {
+            Ok(source.clone())
+        }
+    };
+    Ok((snapshot(q)?, snapshot(k)?, snapshot(v)?))
+}
+
 // Append into the original cache and return a rotated Q.
 fn update(args: &[AnyView]) -> Result<Any> {
     if !matches!(args.len(), 12 | 14) {

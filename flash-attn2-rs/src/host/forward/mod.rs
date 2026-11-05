@@ -711,7 +711,7 @@ fn launch_forward(args: &[AnyView], input: PreparedForward) -> Result<Any> {
     if splits > 1 {
         kparams.push((&mut split_count as *mut u32).cast());
     }
-    let (flash_fn, dense192_selected) = select_kernel(&input, &mut plan, rt)?;
+    let (flash_fn, dense_smem, qsmem_selected) = select_kernel(&input, &mut plan, rt)?;
     let tile = plan.tile;
     rt.ctx
         .bind_to_thread()
@@ -728,8 +728,10 @@ fn launch_forward(args: &[AnyView], input: PreparedForward) -> Result<Any> {
             flash_fn.cu_function(),
             grid,
             (tile.threads, 1, 1),
-            if dense192_selected {
-                98304
+            if let Some(smem) = dense_smem {
+                smem
+            } else if qsmem_selected {
+                crate::host::tiles::qsmem_smem_bytes(bucket, tile.keys)
             } else if splits > 1 {
                 split_smem_bytes(bucket, tile)
             } else {

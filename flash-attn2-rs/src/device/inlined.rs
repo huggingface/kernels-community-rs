@@ -68,6 +68,19 @@ pub fn mma<const BF16: bool>(c: [f32; 4], a: [u32; 4], b: [u32; 2]) -> [f32; 4] 
 }
 
 #[inline(always)]
+pub fn cvt_relu<const BF16: bool>(lo: f32, hi: f32) -> u32 {
+    let out: u32;
+    unsafe {
+        if BF16 {
+            ptx_asm!("cvt.rn.relu.bf16x2.f32 %0, %2, %1;", out("=r") out, in("f") lo, in("f") hi, options(register_only));
+        } else {
+            ptx_asm!("cvt.rn.relu.f16x2.f32 %0, %2, %1;", out("=r") out, in("f") lo, in("f") hi, options(register_only));
+        }
+    }
+    out
+}
+
+#[inline(always)]
 pub fn cvt<const BF16: bool>(lo: f32, hi: f32) -> u32 {
     if BF16 {
         cvt_bf16x2_f32(lo, hi)

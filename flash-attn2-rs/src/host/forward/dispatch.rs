@@ -180,6 +180,17 @@ pub(super) fn plan_forward(input: &PreparedForward, rt: &Runtime) -> ForwardPlan
     } else {
         1
     };
+    // Small D32 query grids benefit from 128-key partitions. Cap the merge
+    // at 16 partitions: larger scratch reductions outweigh the extra parallelism.
+    if wide_queries && cross_ctas * splits < rt.sm_count {
+        let more_splits = ((rt.sm_count + cross_ctas - 1) / cross_ctas)
+            .min(16)
+            .min(seqlen_k / 128);
+        let chunk = (seqlen_k + more_splits - 1) / more_splits;
+        if more_splits > splits && chunk % 64 == 0 {
+            splits = more_splits;
+        }
+    }
     // Full unmasked grids trade one split for less merge traffic.
     if wide_queries && wr < 0 && cross_ctas == rt.sm_count && splits == 4 {
         let chunk = (seqlen_k + 2) / 3;
@@ -254,7 +265,7 @@ pub(super) fn select_kernel<'a>(
     input: &PreparedForward,
     plan: &mut ForwardPlan,
     rt: &'a Runtime,
-) -> Result<(&'a CudaFunction, bool)> {
+) -> Result<(&'a CudaFunction, Option<u32>, bool)> {
     let PreparedForward {
         bucket,
         wl,
@@ -293,10 +304,14 @@ pub(super) fn select_kernel<'a>(
         && !(cross_split && wr == 0 && seqlen_q > 32);
     // Shared-Q tile for mostly filled waves on SM89.
     let dense192_ctas = ((seqlen_q + 127) / 128) * bh;
+    // Whole waves of long sequences also win (4096: 1509 -> 1391 us); 0.75
+    // and 1.25 waves measured 5-10% slower than the 64-row tile.
+    let dense192_waves = seqlen_k >= 2048 && dense192_ctas % rt.sm_count == 0;
     let dense192_selected = !dropout
-        && dense192_ctas >= (5 * rt.sm_count + 7) / 8
-        && dense192_ctas <= rt.sm_count
-        && seqlen_k <= 512
+        && (dense192_waves
+            || (dense192_ctas >= (5 * rt.sm_count + 7) / 8
+                && dense192_ctas <= rt.sm_count
+                && seqlen_k <= 1024))
         && d == 192
         && h == hk
         && splits == 1
@@ -317,7 +332,61 @@ pub(super) fn select_kernel<'a>(
         && q_str.batch as i64 == seqlen_q * h * 96
         && k_str.batch as i64 == seqlen_k * h * 96
         && v_str.batch as i64 == seqlen_k * h * 96;
-    let flash_fn = if dropout {
+    // Reference-shaped resident-Q tiles for exact unmasked packed MHA, d96 on
+    // 128x64, d32 on 128x128 and d256 on 64x64, once the grid fills a wave
+    // (1024 keys: d96 46.3 -> 42.7 us, d32 21.5 -> 18.5 us, d256 118 -> 113
+    // us; 4096: 646 -> 600 us, 227 -> 221 us, 1840 -> 1732 us). Smaller grids
+    // keep the smaller tiles for SM coverage.
+    let resident_rows = if d == 256 { 64 } else { 128 };
+    let resident_keys = if d == 32 { 128 } else { 64 };
+    let resident_ctas = ((seqlen_q + resident_rows - 1) / resident_rows) * bh;
+    let du = d / 2;
+    let resident_selected = !dropout
+        && (d == 96 || d == 32 || d == 256)
+        && resident_ctas >= rt.sm_count
+        && h == hk
+        && splits == 1
+        && seqlen_q % resident_rows == 0
+        && seqlen_k % resident_keys == 0
+        && wl < 0
+        && wr < 0
+        && has_alibi == 0
+        && softcap == 0.0
+        && (scale as f32) > 0.0
+        && ((scale as f32) * std::f32::consts::LOG2_E).is_finite()
+        && q_str.head as i64 == du
+        && k_str.head as i64 == du
+        && v_str.head as i64 == du
+        && q_str.seq as i64 == h * du
+        && k_str.seq as i64 == h * du
+        && v_str.seq as i64 == h * du
+        && q_str.batch as i64 == seqlen_q * h * du
+        && k_str.batch as i64 == seqlen_k * h * du
+        && v_str.batch as i64 == seqlen_k * h * du;
+    // Resident-Q 128x64 tile for long unmasked exact d32: 4096 keys 273 ->
+    // 248 us against the 128x64 register-Q raw tile (reference 240).
+    let qsmem_selected = !dropout
+        && !resident_selected
+        && splits == 1
+        && bucket == 32
+        && d == 32
+        && seqlen_q >= 1024
+        && seqlen_k >= 1024
+        && wl < 0
+        && wr < 0
+        && has_alibi == 0
+        && softcap == 0.0
+        && (scale as f32) > 0.0
+        && ((scale as f32) * std::f32::consts::LOG2_E).is_finite();
+    let flash_fn = if qsmem_selected {
+        tile = Tile {
+            rows: 128,
+            keys: 64,
+            threads: 128,
+            alternate: false,
+        };
+        rt.qsmem_fns.get(&(bucket, 64, is_bf16)).unwrap()
+    } else if dropout {
         rt.dropout_fns
             .get(&(
                 bucket,
@@ -339,6 +408,20 @@ pub(super) fn select_kernel<'a>(
             alternate: false,
         };
         rt.dense_d192_fns.get(&is_bf16).unwrap()
+    } else if resident_selected {
+        tile = Tile {
+            rows: resident_rows,
+            keys: resident_keys as usize,
+            threads: if d == 32 { 256 } else { 128 },
+            alternate: false,
+        };
+        if d == 256 {
+            rt.dense_d256_fns.get(&is_bf16).unwrap()
+        } else if d == 96 {
+            rt.dense_d96_fns.get(&is_bf16).unwrap()
+        } else {
+            rt.dense_d32_fns.get(&is_bf16).unwrap()
+        }
     } else if wide_queries {
         // Three splits favor rolled copies; other Q64 splits unroll.
         rt.wide_query_split_fns
@@ -374,13 +457,8 @@ pub(super) fn select_kernel<'a>(
         // Coordinate increments for short sequences, <= 1 CTA per SM.
         rt.short_d192_fns.get(&(tile.alternate, is_bf16)).unwrap()
     } else if bucket == 32
-        && tile.alternate
-        && seqlen_q >= 1024
-        && (if d == 8 {
-            seqlen_q >= 2048 && seqlen_k >= 2048 && (seqlen_q >= 4096 || seqlen_k >= 4096)
-        } else {
-            seqlen_k >= if d == 32 { 1024 } else { 2048 }
-        })
+        && d == 32
+        && !tile.alternate
         && wl < 0
         && wr < 0
         && has_alibi == 0
@@ -388,7 +466,34 @@ pub(super) fn select_kernel<'a>(
         && (scale as f32) > 0.0
         && ((scale as f32) * std::f32::consts::LOG2_E).is_finite()
     {
-        // Wider key tiles for these dense workloads; grid recomputed below.
+        // Unmasked exact d32 on the 64x64 tile folds the scale into the
+        // exponent (1024: 25.2 -> 24.1 us, 512: 12.3 -> 11.7 us).
+        rt.raw64_d32_fns.get(&is_bf16).unwrap()
+    } else if bucket == 32 && (wl >= 0 || wr >= 0) {
+        // Masked small heads: 128-key tiles halve the barriers per key
+        // (causal 1024: 23.1 -> 20.8 us, 4096: 186 -> 181 us).
+        tile = Tile {
+            rows: 64,
+            keys: 128,
+            threads: 128,
+            alternate: false,
+        };
+        rt.wide_masked_d32_fns.get(&is_bf16).unwrap()
+    } else if bucket == 32
+        && tile.alternate
+        && d == 8
+        && seqlen_q >= 2048
+        && seqlen_k >= 2048
+        && (seqlen_q >= 4096 || seqlen_k >= 4096)
+        && wl < 0
+        && wr < 0
+        && has_alibi == 0
+        && softcap == 0.0
+        && (scale as f32) > 0.0
+        && ((scale as f32) * std::f32::consts::LOG2_E).is_finite()
+    {
+        // Wider key tiles for tiny heads; grid recomputed below. Exact d32
+        // measured 22% faster on the 128x64 raw tile below (4096: 351 -> 276 us).
         tile = Tile {
             rows: 64,
             keys: 128,
@@ -406,6 +511,24 @@ pub(super) fn select_kernel<'a>(
         && ((scale as f32) * std::f32::consts::LOG2_E).is_finite()
     {
         rt.raw_d32_fns.get(&is_bf16).unwrap()
+    } else if rt.sm89
+        && d == 64
+        && seqlen_q >= 512
+        && seqlen_k >= 2048
+        && ((seqlen_q + 127) / 128) * bh >= 2 * rt.sm_count
+        && wl < 0
+        && wr < 0
+        && has_alibi == 0
+        && softcap == 0.0
+        && (scale as f32) > 0.0
+        && ((scale as f32) * std::f32::consts::LOG2_E).is_finite()
+    {
+        tile = Tile {
+            rows: 128,
+            keys: 32,
+            ..default_tile(64)
+        };
+        rt.raw_d64_fns.get(&is_bf16).unwrap()
     } else if bucket == 128
         && seqlen_q >= 512
         && seqlen_k >= 4096
@@ -433,5 +556,12 @@ pub(super) fn select_kernel<'a>(
             })?
     };
     plan.tile = tile;
-    Ok((flash_fn, dense192_selected))
+    let dense_smem = if dense192_selected {
+        Some(98304)
+    } else if resident_selected {
+        Some(((resident_rows + 2 * resident_keys) * d * 2) as u32)
+    } else {
+        None
+    };
+    Ok((flash_fn, dense_smem, qsmem_selected))
 }

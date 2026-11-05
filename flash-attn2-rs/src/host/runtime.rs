@@ -9,7 +9,8 @@ use crate::host::cuda::{self, CudaContext, CudaFunction, CudaModule, sys};
 use crate::host::err;
 use crate::host::tiles::{
     ALTERNATE_BUCKETS, HEAD_DIMS, Tile, alternate_tile, combined_smem, default_tile, dropout_tile,
-    flash_kernel_name, flash_smem_bytes, split_smem_bytes, split_tile,
+    flash_kernel_name, flash_smem_bytes, paged_causal_tile, qsmem_smem_bytes, split_smem_bytes,
+    split_tile, wide_smem_bytes,
 };
 
 pub(super) struct Runtime {
@@ -35,9 +36,11 @@ pub(super) struct Runtime {
     pub(super) bwd_dkv_fns: HashMap<(i64, bool), CudaFunction>,
     pub(super) bwd_dkv_specialized_fns: HashMap<(bool, bool, u8), CudaFunction>,
     pub(super) bwd_dkv_merge_fns: HashMap<bool, CudaFunction>,
+    pub(super) cached_wide_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) cached_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) cached_split_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) varlen_split_fns: HashMap<(i64, bool, bool, bool), CudaFunction>,
+    pub(super) paged_causal256_fns: HashMap<(i64, bool), CudaFunction>,
     pub(super) paged_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) varlen_rng_fns: HashMap<bool, CudaFunction>,
     pub(super) varlen_fns: HashMap<(i64, bool, bool), CudaFunction>,
@@ -49,9 +52,16 @@ pub(super) struct Runtime {
     pub(super) scalar_fns: HashMap<(i64, bool, bool), CudaFunction>,
     pub(super) short_d192_fns: HashMap<(bool, bool), CudaFunction>,
     pub(super) dense_d192_fns: HashMap<bool, CudaFunction>,
+    pub(super) dense_d96_fns: HashMap<bool, CudaFunction>,
+    pub(super) dense_d32_fns: HashMap<bool, CudaFunction>,
+    pub(super) dense_d256_fns: HashMap<bool, CudaFunction>,
+    pub(super) raw_d64_fns: HashMap<bool, CudaFunction>,
     pub(super) raw_d128_fns: HashMap<bool, CudaFunction>,
     pub(super) raw_d32_fns: HashMap<bool, CudaFunction>,
     pub(super) wide_d32_fns: HashMap<bool, CudaFunction>,
+    pub(super) wide_masked_d32_fns: HashMap<bool, CudaFunction>,
+    pub(super) raw64_d32_fns: HashMap<bool, CudaFunction>,
+    pub(super) qsmem_fns: HashMap<(i64, usize, bool), CudaFunction>,
 
     pub(super) split_fns: HashMap<(i64, bool, i64), CudaFunction>,
     pub(super) merge_fns: HashMap<bool, CudaFunction>,
@@ -121,6 +131,40 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
         };
         wide_d32_fns.insert(bf16, load_flash(&name, flash_smem_bytes(32, tile))?);
     }
+    let mut qsmem_fns = HashMap::new();
+    for (bucket, keys) in [(32i64, 64usize)] {
+        for bf16 in [false, true] {
+            let name = format!(
+                "flash_attn_fwd_d{bucket}_qs_k{keys}{}",
+                if bf16 { "_bf16" } else { "" }
+            );
+            qsmem_fns.insert(
+                (bucket, keys, bf16),
+                load_flash(&name, qsmem_smem_bytes(bucket, keys))?,
+            );
+        }
+    }
+    let mut raw64_d32_fns = HashMap::new();
+    for bf16 in [false, true] {
+        let name = format!(
+            "flash_attn_fwd_d32_raw64{}",
+            if bf16 { "_bf16" } else { "" }
+        );
+        raw64_d32_fns.insert(
+            bf16,
+            load_flash(&name, flash_smem_bytes(32, default_tile(32)))?,
+        );
+    }
+    let mut wide_masked_d32_fns = HashMap::new();
+    for bf16 in [false, true] {
+        let name = format!("flash_attn_fwd_d32_wide{}", if bf16 { "_bf16" } else { "" });
+        let tile = Tile {
+            rows: 64,
+            keys: 128,
+            ..alternate_tile(32)
+        };
+        wide_masked_d32_fns.insert(bf16, load_flash(&name, flash_smem_bytes(32, tile))?);
+    }
     let mut raw_d32_fns = HashMap::new();
     for bf16 in [false, true] {
         let name = format!("flash_attn_fwd_d32_raw{}", if bf16 { "_bf16" } else { "" });
@@ -136,6 +180,37 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
             if bf16 { "_bf16" } else { "" }
         );
         dense_d192_fns.insert(bf16, load_flash(&name, 98304)?);
+    }
+    let mut dense_d96_fns = HashMap::new();
+    let mut dense_d32_fns = HashMap::new();
+    let mut dense_d256_fns = HashMap::new();
+    for bf16 in [false, true] {
+        let dtype = if bf16 { "_bf16" } else { "" };
+        dense_d96_fns.insert(
+            bf16,
+            load_flash(&format!("flash_attn_fwd_d96_dense{dtype}"), 49152)?,
+        );
+        dense_d32_fns.insert(
+            bf16,
+            load_flash(&format!("flash_attn_fwd_d32_dense{dtype}"), 24576)?,
+        );
+        dense_d256_fns.insert(
+            bf16,
+            load_flash(&format!("flash_attn_fwd_d256_dense{dtype}"), 98304)?,
+        );
+    }
+    let mut raw_d64_fns = HashMap::new();
+    for bf16 in [false, true] {
+        let name = format!(
+            "flash_attn_fwd_d64_q128_k32_raw{}",
+            if bf16 { "_bf16" } else { "" }
+        );
+        let tile = Tile {
+            rows: 128,
+            keys: 32,
+            ..default_tile(64)
+        };
+        raw_d64_fns.insert(bf16, load_flash(&name, flash_smem_bytes(64, tile))?);
     }
     let mut raw_d128_fns = HashMap::new();
     for bf16 in [false, true] {
@@ -541,6 +616,22 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
             }
         }
     }
+    let mut cached_wide_fns = HashMap::new();
+    for bucket in HEAD_DIMS {
+        for bf16 in [false, true] {
+            for grouped in [false, true] {
+                let name = format!(
+                    "cached_fwd_cache_d{bucket}_wide{}{}",
+                    if grouped { "_grouped" } else { "" },
+                    if bf16 { "_bf16" } else { "" }
+                );
+                cached_wide_fns.insert(
+                    (bucket, bf16, grouped),
+                    load_flash(&name, wide_smem_bytes(bucket))?,
+                );
+            }
+        }
+    }
     let mut cached_split_fns = HashMap::new();
     for bucket in HEAD_DIMS {
         for bf16 in [false, true] {
@@ -604,6 +695,19 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
                     load_flash(&name, flash_smem_bytes(bucket, dropout_tile(bucket)))?,
                 );
             }
+        }
+    }
+    let mut paged_causal256_fns = HashMap::new();
+    for bucket in HEAD_DIMS {
+        for bf16 in [false, true] {
+            let name = format!(
+                "paged_fwd_paged_d{bucket}_causal256{}",
+                if bf16 { "_bf16" } else { "" }
+            );
+            paged_causal256_fns.insert(
+                (bucket, bf16),
+                load_flash(&name, flash_smem_bytes(bucket, paged_causal_tile(bucket)))?,
+            );
         }
     }
     let mut paged_fns = HashMap::new();
@@ -742,7 +846,9 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
         varlen_rng_fns,
         varlen_fns,
         paged_fns,
+        paged_causal256_fns,
         cached_fns,
+        cached_wide_fns,
         cached_split_fns,
         varlen_split_fns,
         cache_copy_fns,
@@ -763,9 +869,16 @@ pub(super) fn runtime(device: i32) -> Result<&'static Runtime> {
         scalar_fns,
         short_d192_fns,
         dense_d192_fns,
+        dense_d96_fns,
+        dense_d32_fns,
+        dense_d256_fns,
         raw_d128_fns,
+        raw_d64_fns,
         raw_d32_fns,
         wide_d32_fns,
+        wide_masked_d32_fns,
+        raw64_d32_fns,
+        qsmem_fns,
         split_fns,
         merge_fns,
         merge4_fns,

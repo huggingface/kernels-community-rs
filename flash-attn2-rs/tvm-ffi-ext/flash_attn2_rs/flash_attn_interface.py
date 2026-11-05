@@ -3,14 +3,27 @@ from functools import cache
 import math
 import operator
 
+from tvm_ffi import get_global_func
+
 from ._ops import ops
 
+# Array.__getitem__ re-reads the length on every index; call the accessor directly.
+_array_item = get_global_func("ffi.ArrayGetItem")
+_array_size = get_global_func("ffi.ArraySize")
 
-def _torch_tensors(values):
-    # tvm-ffi converts returned tensors to torch, but not tensors in a returned Array.
+
+def _torch_tensors(values, count=None):
+    # tvm-ffi hands back torch tensors when indexing a returned Array of a call
+    # made with torch arguments; only convert elements it left as ffi.Tensor.
     import torch
 
-    return [torch.from_dlpack(value) for value in values]
+    if count is None:
+        count = _array_size(values)
+    tensors = [_array_item(values, i) for i in range(count)]
+    for i, value in enumerate(tensors):
+        if not isinstance(value, torch.Tensor):
+            tensors[i] = torch.from_dlpack(value)
+    return tensors
 
 
 def fwd_explicit(*args):
@@ -71,6 +84,16 @@ def _rng_descriptor_values(gen, device, increment):
         intragraph.item(),
         int(captured),
     )
+
+
+# Head sizes with folded decode kernels; other sizes pad up to a bucket.
+_EXACT_HEAD_DIMS = (32, 64, 96, 128, 192, 256)
+
+
+@cache
+def _cuda_multiprocessors(device_index):
+    import torch
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @cache
@@ -844,7 +867,7 @@ def fwd(
             with torch.cuda.device(q.device):
                 values = launch()
         if return_softmax:
-            output, lse, probabilities = _torch_tensors(values)
+            output, lse, probabilities = _torch_tensors(values, 3)
         else:
             lse = values
             probabilities = torch.empty(0, device=q.device, dtype=q.dtype)
@@ -1220,7 +1243,7 @@ def varlen_fwd(
         *([None, seed, offset, intragraph, bool(captured)]
           if fused_rng else [block_table] if paged else []),
     )
-    output, lse, probabilities = _torch_tensors(values)
+    output, lse, probabilities = _torch_tensors(values, 3)
     if output.ndim == 4:  # Preserve compatibility with rank-four native results.
         output = output.squeeze(0)
     swap_groups = (
@@ -1491,9 +1514,14 @@ def fwd_kvcache(
     window_size_right=-1,
     softcap=0.0,
     is_rotary_interleaved=False,
-    num_splits=1,
+    num_splits=None,
 ):
-    """Native cached inference; append K/V in place and return [out, LSE]."""
+    """Native cached inference; append K/V in place and return [out, LSE].
+
+    ``num_splits`` defaults to the automatic heuristic (v2's ``0``): decode
+    grids rarely fill the GPU, so split partials plus a merge beat one block
+    per head streaming the whole cache.
+    """
     import torch
 
     if softmax_scale is None:
@@ -1531,7 +1559,7 @@ def fwd_kvcache(
         is_rotary_interleaved = _bool_arg(
             is_rotary_interleaved, "is_rotary_interleaved"
         )
-        splits = _int_arg(num_splits, "num_splits")
+        splits = 0 if num_splits is None else _int_arg(num_splits, "num_splits")
     except RuntimeError:
         _check_tensor_types(
             "q kcache vcache k_ v_ seqlens_k_ rotary_cos_ rotary_sin_ cache_batch_idx_ leftpad_k_ block_table_ alibi_slopes_ out_",
@@ -1587,8 +1615,17 @@ def fwd_kvcache(
         )
     if alibi_slopes is not None:
         alibi_slopes = alibi_slopes.contiguous()
+    # Short plain appends have a single attention block owning each cache head.
+    defer_append = (0 < new_keys <= 16 and sq == 1 and d in _EXACT_HEAD_DIMS and capacity >= 1024
+                    and splits == 1 and not is_causal and left < 0 and right < 0
+                    and cap <= 0 and alibi_slopes is None and rotary_cos is None
+                    and cache_batch_idx is None and block_table is None and leftpad_k is None
+                    and h // kp.shape[2] <= 64 and _cuda_capability(q.device.index) == (8, 9)
+                    and b * h <= _cuda_multiprocessors(q.device.index)
+                    and c_float(scale).value > 0
+                    and math.isfinite(c_float(c_float(scale).value * math.log2(math.e)).value))
     # v2 validates rotary tables above but skips rotation for an empty append.
-    if new_keys > 0:
+    if new_keys > 0 and not defer_append:
         qp = ops.cache_update_explicit(
             qp,
             kp,
@@ -1606,13 +1643,12 @@ def fwd_kvcache(
             leftpad_k,
             alibi_slopes,
         )
-        if d == padded_d:
-            # Native writes bypass Torch in-place ops; padded caches use copy_.
-            torch.autograd.graph.increment_version((kcache, vcache))
+    if new_keys > 0 and d == padded_d and not defer_append:
+        # Native writes bypass Torch in-place ops; padded caches use copy_.
+        torch.autograd.graph.increment_version((kcache, vcache))
     # Reuse K/V across GQA heads by treating groups as query rows.
     grouped = (
         sq == 1
-        and d == 128
         and h > kp.shape[2]
         and capacity >= 1024
         and left < 0
@@ -1623,10 +1659,7 @@ def fwd_kvcache(
     if grouped and splits < 1:
         # Keep one split when it already fills the GPU.
         group_ctas = b * kp.shape[2] * ((h // kp.shape[2] + 63) // 64)
-        grouped = (
-            group_ctas
-            <= torch.cuda.get_device_properties(q.device).multi_processor_count
-        )
+        grouped = group_ctas <= _cuda_multiprocessors(q.device.index)
     attention_q, attention_sq = qp, sq
     if grouped:
         attention_sq = h // kp.shape[2]
@@ -1656,15 +1689,19 @@ def fwd_kvcache(
         new_keys,
         splits,
         grouped,
+        *([k, v] if defer_append else []),
     )
-    output, lse, _ = _torch_tensors(values)
+    if defer_append:
+        torch.autograd.graph.increment_version((kcache, vcache))
+    output, lse = _torch_tensors(values, 2)
     if grouped:
         output = output.reshape(b, 1, h, padded_d)
         lse = lse.reshape(b, h, 1)
-    if new_keys > 0 and d != padded_d:
-        kcache.copy_(kp[..., :d])
-        vcache.copy_(vp[..., :d])
-    output = output[..., :d]
+    if d != padded_d:
+        if new_keys > 0:
+            kcache.copy_(kp[..., :d])
+            vcache.copy_(vp[..., :d])
+        output = output[..., :d]
     if out is not None and grouped_out:
         hk = kcache.shape[2]
         # v2 accepts output in its internal [B, groups, Hk, D] layout.
