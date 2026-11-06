@@ -1,0 +1,17 @@
+[general]
+name = "activation-cutile"
+version = 1
+edition = 6
+license = "Apache-2.0"
+backends = ["cuda"]
+
+[general.hub]
+repo-id = "kernels-community-rs/activation-cutile"
+
+[tvm-ffi]
+
+[kernel.activation_cutile]
+language = "rust-cutile"
+cargo-manifest = "Cargo.toml"
+src = ["Cargo.toml", "Cargo.lock", "src"]
+tileiras-minver = "13.2"
