@@ -665,6 +665,61 @@ pub trait Spec {
         meta: Packed,
     );
 }
+// Compute dK and dV in the same warps so QK/probabilities are evaluated once;
+// dQ stays separate for deterministic calls.
+pub struct CombinedDkv<const BF16: bool>;
+impl<const BF16: bool> Spec for CombinedDkv<BF16> {
+    #[inline(always)]
+    unsafe fn run(
+        q: *const u32,
+        k: *const u32,
+        v: *const u32,
+        dout: *const u32,
+        lse: *const f32,
+        delta: *const f32,
+        _dq: *mut u32,
+        dk: *mut u32,
+        dv: *mut u32,
+        alibi: *const f32,
+        mut cfg: FwdConfig,
+        do_strides: Strides,
+        gradient_scale: f32,
+        _dropout: Dropout,
+        meta: Packed,
+    ) {
+        unsafe {
+            let b = thread::blockIdx_z();
+            let seq = meta.sequence(b);
+            if !meta.valid(seq, &cfg) || thread::blockIdx_x() * 64 >= seq.sk {
+                return;
+            }
+            cfg.seqlen_q = seq.sq;
+            cfg.seqlen_k = seq.sk;
+            cfg.tanh_scale = 0.0;
+            cfg.has_alibi = 0;
+            let output_stride = (cfg.h / cfg.gqa * cfg.hs_u32) as usize;
+            crate::device::backward::dkv_both_core::<BF16, 64, 4, 8, false, false, false, 32>(
+                q.add(seq.qs as usize * cfg.q.seq as usize),
+                k.add(seq.ks as usize * cfg.k.seq as usize),
+                v.add(seq.ks as usize * cfg.v.seq as usize),
+                dout.add(seq.qs as usize * do_strides.seq as usize),
+                lse.add(seq.qs as usize),
+                delta.add(seq.qs as usize + b as usize * 128),
+                dk.add(seq.ks as usize * output_stride),
+                dv.add(seq.ks as usize * output_stride),
+                alibi,
+                cfg,
+                do_strides,
+                gradient_scale,
+                Dropout::NONE,
+                Some((meta.total_q, meta.delta_stride)),
+            );
+        }
+    }
+}
+pub type dkv_d64_combined = CombinedDkv<false>;
+pub type dkv_d64_combined_bf16 = CombinedDkv<true>;
+
 pub struct Backward<
     const BF16: bool,
     const HD: usize,
@@ -749,95 +804,220 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type dq_d32 = Backward<false, 32, 2, 4, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32 = Backward<false, 32, 2, 4, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d32_bf16 = Backward<true, 32, 2, 4, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_bf16 = Backward<true, 32, 2, 4, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64 = Backward<false, 64, 4, 8, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64 = Backward<false, 64, 4, 8, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_bf16 = Backward<true, 64, 4, 8, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_bf16 = Backward<true, 64, 4, 8, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d96 = Backward<false, 96, 6, 12, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96 = Backward<false, 96, 6, 12, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d96_bf16 = Backward<true, 96, 6, 12, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_bf16 = Backward<true, 96, 6, 12, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128 = Backward<false, 128, 8, 16, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128 = Backward<false, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_bf16 = Backward<true, 128, 8, 16, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_bf16 = Backward<true, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d192 = Backward<false, 192, 12, 24, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192 = Backward<false, 192, 12, 24, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d192_bf16 = Backward<true, 192, 12, 24, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_bf16 = Backward<true, 192, 12, 24, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d256 = Backward<false, 256, 16, 32, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256 = Backward<false, 256, 16, 32, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d256_bf16 = Backward<true, 256, 16, 32, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_bf16 = Backward<true, 256, 16, 32, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_partial = Backward<false, 32, 2, 4, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_partial_bf16 = Backward<true, 32, 2, 4, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial = Backward<false, 64, 4, 8, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial_bf16 = Backward<true, 64, 4, 8, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_partial = Backward<false, 96, 6, 12, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_partial_bf16 = Backward<true, 96, 6, 12, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial = Backward<false, 128, 8, 16, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_bf16 = Backward<true, 128, 8, 16, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_partial = Backward<false, 192, 12, 24, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_partial_bf16 = Backward<true, 192, 12, 24, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_partial = Backward<false, 256, 16, 32, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_partial_bf16 = Backward<true, 256, 16, 32, true, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2 = Backward<false, 64, 4, 8, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2_bf16 = Backward<true, 64, 4, 8, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split2 = Backward<false, 128, 8, 16, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split2_bf16 = Backward<true, 128, 8, 16, false, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial_causal = Backward<false, 64, 4, 8, true, true, 1, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_partial_causal_bf16 = Backward<true, 64, 4, 8, true, true, 1, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2_causal = Backward<false, 64, 4, 8, false, false, 2, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_split2_causal_bf16 = Backward<true, 64, 4, 8, false, false, 2, true>;
+
+// Head-dimension-generic fused backward for packed MHA without dropout,
+// reusing the dense generic core on per-sequence pointers.
+pub struct GenericPacked<
+    const BF16: bool,
+    const CAUSAL: bool,
+    const HD: usize,
+    const BM: usize,
+    const BN: usize,
+    const SM: usize,
+    const VREG: bool,
+    const KS: usize,
+    const NT: usize,
+    const KVN: usize,
+    const QN: usize,
+    const VK: usize,
+    const DB: bool,
+    const WARPS: usize,
+>;
+impl<
+    const BF16: bool,
+    const CAUSAL: bool,
+    const HD: usize,
+    const BM: usize,
+    const BN: usize,
+    const SM: usize,
+    const VREG: bool,
+    const KS: usize,
+    const NT: usize,
+    const KVN: usize,
+    const QN: usize,
+    const VK: usize,
+    const DB: bool,
+    const WARPS: usize,
+> Spec for GenericPacked<BF16, CAUSAL, HD, BM, BN, SM, VREG, KS, NT, KVN, QN, VK, DB, WARPS>
+{
+    #[inline(always)]
+    unsafe fn run(
+        q: *const u32,
+        k: *const u32,
+        v: *const u32,
+        dout: *const u32,
+        lse: *const f32,
+        delta: *const f32,
+        dq: *mut u32,
+        dk: *mut u32,
+        dv: *mut u32,
+        alibi: *const f32,
+        mut cfg: FwdConfig,
+        do_strides: Strides,
+        gradient_scale: f32,
+        _dropout: Dropout,
+        meta: Packed,
+    ) {
+        unsafe {
+            // Must match the coordinates the core derives.
+            let (key_block, _, b) =
+                crate::device::backward::generic_grid_coords(HD != 256 && CAUSAL);
+            let seq = meta.sequence(b);
+            if !meta.valid(seq, &cfg) || key_block * BN as u32 >= seq.sk {
+                return;
+            }
+            cfg.seqlen_q = seq.sq;
+            cfg.seqlen_k = seq.sk;
+            cfg.tanh_scale = 0.0;
+            cfg.has_alibi = 0;
+            cfg.window_left = -1;
+            cfg.window_right = if CAUSAL { 0 } else { -1 };
+            let output_stride = (cfg.h * cfg.hs_u32) as usize;
+            crate::device::backward::generic_core::<
+                BF16,
+                false,
+                false,
+                HD,
+                BM,
+                BN,
+                SM,
+                VREG,
+                KS,
+                NT,
+                KVN,
+                QN,
+                VK,
+                DB,
+                WARPS,
+            >(
+                q.add(seq.qs as usize * cfg.q.seq as usize),
+                k.add(seq.ks as usize * cfg.k.seq as usize),
+                v.add(seq.ks as usize * cfg.v.seq as usize),
+                dout.add(seq.qs as usize * do_strides.seq as usize),
+                lse.add(seq.qs as usize),
+                delta.add(seq.qs as usize + b as usize * 128),
+                dk.add(seq.ks as usize * output_stride),
+                dv.add(seq.ks as usize * output_stride),
+                dq.cast::<f32>()
+                    .add((seq.qs as usize + b as usize * 128) * cfg.h as usize * HD),
+                alibi,
+                cfg,
+                do_strides,
+                gradient_scale,
+                Dropout::NONE,
+                Some((meta.total_q, meta.delta_stride)),
+            );
+        }
+    }
+}
+type PackedD32<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 32, 64, 64, 1, false, 2, 4, 1, 1, 1, false, 8>;
+type PackedD64<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 64, 64, 64, 1, false, 4, 4, 2, 2, 1, false, 8>;
+type PackedD96<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 96, 64, 64, 1, false, 6, 4, 3, 3, 1, true, 8>;
+type PackedD128<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 128, 64, 64, 1, true, 8, 4, 4, 4, 8, true, 8>;
+type PackedD192<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 192, 32, 64, 1, false, 12, 2, 6, 3, 1, false, 8>;
+type PackedD256<const BF16: bool, const CAUSAL: bool> =
+    GenericPacked<BF16, CAUSAL, 256, 64, 32, 1, true, 16, 2, 4, 8, 16, false, 8>;
+pub type generic_d32 = PackedD32<false, false>;
+pub type generic_d32_causal = PackedD32<false, true>;
+pub type generic_d32_bf16 = PackedD32<true, false>;
+pub type generic_d32_bf16_causal = PackedD32<true, true>;
+pub type generic_d64 = PackedD64<false, false>;
+pub type generic_d64_causal = PackedD64<false, true>;
+pub type generic_d64_bf16 = PackedD64<true, false>;
+pub type generic_d64_bf16_causal = PackedD64<true, true>;
+pub type generic_d96 = PackedD96<false, false>;
+pub type generic_d96_causal = PackedD96<false, true>;
+pub type generic_d96_bf16 = PackedD96<true, false>;
+pub type generic_d96_bf16_causal = PackedD96<true, true>;
+pub type generic_d128 = PackedD128<false, false>;
+pub type generic_d128_causal = PackedD128<false, true>;
+pub type generic_d128_bf16 = PackedD128<true, false>;
+pub type generic_d128_bf16_causal = PackedD128<true, true>;
+pub type generic_d192 = PackedD192<false, false>;
+pub type generic_d192_causal = PackedD192<false, true>;
+pub type generic_d192_bf16 = PackedD192<true, false>;
+pub type generic_d192_bf16_causal = PackedD192<true, true>;
+pub type generic_d256 = PackedD256<false, false>;
+pub type generic_d256_causal = PackedD256<false, true>;
+pub type generic_d256_bf16 = PackedD256<true, false>;
+pub type generic_d256_bf16_causal = PackedD256<true, true>;
+
 #[kernel(
+    generic_d32,
+    generic_d32_causal,
+    generic_d32_bf16,
+    generic_d32_bf16_causal,
+    generic_d64,
+    generic_d64_causal,
+    generic_d64_bf16,
+    generic_d64_bf16_causal,
+    generic_d96,
+    generic_d96_causal,
+    generic_d96_bf16,
+    generic_d96_bf16_causal,
+    generic_d128,
+    generic_d128_causal,
+    generic_d128_bf16,
+    generic_d128_bf16_causal,
+    generic_d192,
+    generic_d192_causal,
+    generic_d192_bf16,
+    generic_d192_bf16_causal,
+    generic_d256,
+    generic_d256_causal,
+    generic_d256_bf16,
+    generic_d256_bf16_causal,
+    dkv_d64_combined,
+    dkv_d64_combined_bf16,
     dq_d64_split2_causal,
     dq_d64_split2_causal_bf16,
     dkv_d64_partial_causal,
@@ -883,7 +1063,7 @@ pub type dq_d64_split2_causal_bf16 = Backward<true, 64, 4, 8, false, false, 2, t
     dq_d256_bf16,
     dkv_d256_bf16
 )]
-#[launch_bounds(128)]
+#[launch_bounds(256)]
 pub fn varlen_backward<S: Spec>(
     q: &[u32],
     k: &[u32],

@@ -3,33 +3,60 @@ use crate::device::forward::{LOG2_E, online_softmax_pack_raw};
 use crate::device::inlined::{
     cvt, ldmatrix_x4_shared, ldmatrix_x4_trans_shared, lg2_approx, mma, shared_address,
 };
-use cuda_device::async_copy::cp_async_ca_zfill_16;
 use cuda_device::shared::DynamicSharedArray;
 use cuda_device::warp::shuffle_xor_f32;
 use cuda_device::{ptx_asm, thread};
 
-#[inline(always)]
-fn index(row: u32, col: u32) -> u32 {
-    let out: u32;
-    unsafe {
-        ptx_asm!("{ .reg .u32 mask, col2; and.b32 mask, %1, 7; shl.b32 mask, mask, 2; xor.b32 col2, %2, mask; mad.lo.u32 %0, %1, 96, col2; }", out("=r") out, in("r") row, in("r") col, options(register_only));
+// Evaluate the target name at compile time; device code cannot carry strings.
+const HAS_L2_PREFETCH: bool = match option_env!("CUDA_OXIDE_TARGET") {
+    Some(target) => {
+        let bytes = target.as_bytes();
+        let mut arch = 0u32;
+        let mut i = 3;
+        while i < bytes.len() && bytes[i] >= b'0' && bytes[i] <= b'9' {
+            arch = arch * 10 + (bytes[i] - b'0') as u32;
+            i += 1;
+        }
+        arch >= 89
     }
-    out
+    None => false,
+};
+
+#[inline(always)]
+fn index<const ROWS: u32>(row: u32, col: u32) -> u32 {
+    // Three 64-column planes keep tile offsets in separate address bits.
+    ((col / 32) * (ROWS * 32)) | (row * 32) | ((col & 31) ^ ((row & 7) * 4))
 }
 
 #[inline(always)]
 unsafe fn stage<const ROWS: u32>(dst: *mut u32, src: *const u32, stride: u32, tid: u32) {
     unsafe {
-        let mut i = tid * 4;
-        while i < ROWS * 96 {
-            let row = i / 96;
-            let col = i % 96;
-            cp_async_ca_zfill_16(
-                dst.add(index(row, col) as usize),
-                src.add((row * stride + col) as usize) as *const u8,
-                16,
-            );
-            i += 1024;
+        let mut step = 0;
+        while step < ROWS * 3 / 32 {
+            thread::__unroll_config::<0>();
+            let i = tid * 4 + step * 1024;
+            let row = (i / 32) % ROWS;
+            let col = (i / (ROWS * 32)) * 32 + (i % 32);
+            // Full tiles are guaranteed by dispatch. Stream through L2 with a
+            // 128-byte fetch hint; these copies do not need L1 allocation.
+            // The backend emits PTX 7.0 for sm_80, before L2 prefetch hints.
+            // Keep the hint only for the newer targets built by this package.
+            if HAS_L2_PREFETCH {
+                ptx_asm!(
+                    "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;",
+                    in("r") shared_address(dst.add(index::<ROWS>(row, col) as usize)),
+                    in("l") src.add((row * stride + col) as usize) as u64,
+                    clobber("memory")
+                );
+            } else {
+                ptx_asm!(
+                    "cp.async.cg.shared.global [%0], [%1], 16;",
+                    in("r") shared_address(dst.add(index::<ROWS>(row, col) as usize)),
+                    in("l") src.add((row * stride + col) as usize) as u64,
+                    clobber("memory")
+                );
+            }
+            step += 1;
         }
         ptx_asm!("cp.async.commit_group;", clobber("memory"));
     }
@@ -80,9 +107,9 @@ pub unsafe fn run<const BF16: bool>(
             let mut s = [[0.0f32; 4]; 8];
             let mut kc = 0;
             while kc < 12 {
-                thread::__unroll_config::<2>();
+                thread::__unroll_config::<0>();
                 let a = ldmatrix_x4_shared(
-                    qa + index(
+                    qa + index::<128>(
                         warp_row + (lane & 7) + (((lane >> 3) & 1) * 8),
                         kc * 8 + (lane >> 4) * 4,
                     ) * 4,
@@ -91,7 +118,7 @@ pub unsafe fn run<const BF16: bool>(
                 while nt < 8 {
                     thread::__unroll_config::<0>();
                     let b = ldmatrix_x4_shared(
-                        ka + index(
+                        ka + index::<64>(
                             nt * 8 + (lane & 7) + (lane >> 4) * 8,
                             kc * 8 + ((lane & 15) >> 3) * 4,
                         ) * 4,
@@ -131,8 +158,10 @@ pub unsafe fn run<const BF16: bool>(
                 while d < 24 {
                     thread::__unroll_config::<0>();
                     let b = ldmatrix_x4_trans_shared(
-                        va + index(kc as u32 * 16 + (lane & 15), d as u32 * 4 + (lane >> 4) * 4)
-                            * 4,
+                        va + index::<64>(
+                            kc as u32 * 16 + (lane & 15),
+                            d as u32 * 4 + (lane >> 4) * 4,
+                        ) * 4,
                     );
                     out[d] = mma::<BF16>(out[d], a, [b[0], b[1]]);
                     out[d + 1] = mma::<BF16>(out[d + 1], a, [b[2], b[3]]);

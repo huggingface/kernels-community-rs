@@ -16,6 +16,10 @@ pub struct Cache {
     pub batches: u32,
     pub new_keys: u32,
     pub splits: u32,
+    pub append_k: *const u32,
+    pub append_v: *const u32,
+    pub append_ks: crate::device::config::Strides,
+    pub append_vs: crate::device::config::Strides,
 }
 impl Cache {
     pub const NONE: Self = Self {
@@ -23,6 +27,18 @@ impl Cache {
         batches: 0,
         new_keys: 0,
         splits: 1,
+        append_k: core::ptr::null(),
+        append_v: core::ptr::null(),
+        append_ks: crate::device::config::Strides {
+            batch: 0,
+            seq: 0,
+            head: 0,
+        },
+        append_vs: crate::device::config::Strides {
+            batch: 0,
+            seq: 0,
+            head: 0,
+        },
     };
 }
 
@@ -40,6 +56,8 @@ unsafe fn core<
     const CACHED: bool,
     const SPLIT: bool,
     const GROUPED: bool,
+    const VECTOR_OUTPUT: bool,
+    const WIDE: bool,
 >(
     q: *const u32,
     k: *const u32,
@@ -62,12 +80,21 @@ unsafe fn core<
         let groups = if GROUPED { cfg.gqa } else { 1 };
         let heads = if GROUPED { cfg.h / groups } else { cfg.h };
         let query_rows = if GROUPED { groups } else { cfg.seqlen_q };
-        let mut tile = LaunchTile::new::<64, 1, GRID_PLAIN>(
-            heads,
-            if GROUPED { 1 } else { cfg.gqa },
-            query_rows,
-            false,
-        );
+        // Prefill causal grids put the longest query blocks of every head first.
+        let causal_grid = !CACHED
+            && !SPLIT
+            && cfg.window_right == 0
+            && (cfg.window_left < 0 || cfg.window_left >= cfg.seqlen_k as i32);
+        let mut tile = if CACHED || SPLIT {
+            LaunchTile::new::<64, 1, GRID_PLAIN>(
+                heads,
+                if GROUPED { 1 } else { cfg.gqa },
+                query_rows,
+                false,
+            )
+        } else {
+            LaunchTile::new::<64, 1, 0>(heads, cfg.gqa, query_rows, causal_grid)
+        };
         let split = if SPLIT {
             // Fold splits into grid.x so batch remains within CUDA's grid.z limit.
             tile.q_row_base =
@@ -144,7 +171,12 @@ unsafe fn core<
         if CACHED && !PAGED && (cache_batch < 0 || cache_batch as u32 >= cache.batches) {
             return;
         }
-        let o_ss = cfg.h as usize * cfg.hs_u32 as usize;
+        let direct_grouped = CACHED && GROUPED && !SPLIT;
+        let o_ss = if direct_grouped {
+            cfg.hs_u32 as usize
+        } else {
+            cfg.h as usize * cfg.hs_u32 as usize
+        };
         let bases = TensorBases {
             q: (if CACHED {
                 tile.b as usize * cfg.q.batch as usize
@@ -163,14 +195,60 @@ unsafe fn core<
                 0
             }) + (if PAGED { 0 } else { ks + pad }) as usize * cfg.v.seq as usize
                 + tile.kv_head as usize * cfg.v.head as usize,
-            o: qs as usize * o_ss + tile.head as usize * cfg.hs_u32 as usize,
+            o: if direct_grouped {
+                (tile.b as usize * heads as usize + tile.head as usize)
+                    * groups as usize
+                    * cfg.hs_u32 as usize
+            } else {
+                qs as usize * o_ss + tile.head as usize * cfg.hs_u32 as usize
+            },
             o_ss,
         };
+        // The fused launch owns one cache head per block; aliased sources were snapshotted.
+        if WIDE && !cache.append_k.is_null() {
+            if cfg.seqlen_k < cache.new_keys {
+                return;
+            }
+            let start = cfg.seqlen_k - cache.new_keys;
+            let cols = (HD / 2) as u32;
+            let mut i = tile.tid;
+            while i < cache.new_keys * cols {
+                let row = i / cols;
+                let col = i % cols;
+                let ki = tile.b as usize * cache.append_ks.batch as usize
+                    + row as usize * cache.append_ks.seq as usize
+                    + tile.kv_head as usize * cache.append_ks.head as usize
+                    + col as usize;
+                let vi = tile.b as usize * cache.append_vs.batch as usize
+                    + row as usize * cache.append_vs.seq as usize
+                    + tile.kv_head as usize * cache.append_vs.head as usize
+                    + col as usize;
+                *(k as *mut u32)
+                    .add(bases.k + (start + row) as usize * cfg.k.seq as usize + col as usize) =
+                    *cache.append_k.add(ki);
+                *(v as *mut u32)
+                    .add(bases.v + (start + row) as usize * cfg.v.seq as usize + col as usize) =
+                    *cache.append_v.add(vi);
+                i += 128;
+            }
+            thread::sync_threads();
+        }
         if GROUPED {
             // Query rows are adjacent GQA heads at the same position.
             cfg.q.seq = cfg.q.head;
         }
-        let layout = SmemLayout::new::<HD, KEYS, 64>();
+        // Constant copy indices measured faster for these packed tiles; d96 and
+        // d128 lost ~5-10% and the wide d32 decode tile ran out of registers.
+        let unroll_copy = (HD == 32 && !WIDE) || HD == 192;
+        let mut layout = SmemLayout::new::<HD, KEYS, 64>();
+        // Unsplit decode streams the next K tile behind the current one.
+        if WIDE
+            && !layout.double
+            && !layout.triple
+            && 3 * KEYS as usize * layout.stride * 4 <= SMEM_BUDGET
+        {
+            layout.triple = true;
+        }
         let smem = SmemBuffers::new(layout);
         let off = cfg.seqlen_k as i32 - cfg.seqlen_q as i32;
         let slope = if cfg.has_alibi != 0 {
@@ -180,6 +258,7 @@ unsafe fn core<
         };
 
         let scale = cfg.scale * LOG2_E;
+        let raw_scores = WIDE;
         let tanh_scale = cfg.tanh_scale;
         let slope = slope * LOG2_E;
 
@@ -197,42 +276,68 @@ unsafe fn core<
             kv_range.num_tiles = kv_range.num_tiles.min((split + 1) * tiles_per_split);
         }
         let reverse = false;
+        // Page-table entries for tiles j and j+1; j+2 is fetched a tile early.
+        let mut page = 0i32;
+        let mut next_page = 0i32;
         if PAGED {
-            crate::device::varlen::paged::prefetch_first_kv::<HD, KEYS, 128, false, false>(
-                k, v, &cfg, &tile, &bases, kv_range, smem, layout, reverse, pages,
+            page = paged::lookup_page(pages, tile.b, kv_range.start_tile * KEYS);
+            next_page = paged::lookup_page(pages, tile.b, (kv_range.start_tile + 1) * KEYS);
+            paged::prefetch_first_kv::<HD, KEYS, 128, false, false>(
+                k, v, &cfg, &tile, &bases, kv_range, smem, layout, reverse, pages, page,
             );
         } else {
-            prefetch_first_kv::<HD, KEYS, 128, false, false>(
-                k, v, &cfg, &tile, &bases, kv_range, smem, layout, reverse,
-            );
+            if unroll_copy {
+                prefetch_first_kv::<HD, KEYS, 128, true, false>(
+                    k, v, &cfg, &tile, &bases, kv_range, smem, layout, reverse,
+                );
+            } else {
+                prefetch_first_kv::<HD, KEYS, 128, false, false>(
+                    k, v, &cfg, &tile, &bases, kv_range, smem, layout, reverse,
+                );
+            }
         }
 
         let mut j = kv_range.start_tile;
         while j < kv_range.num_tiles {
             let kv_base = j * KEYS;
+            let after_next_page = if PAGED {
+                paged::lookup_page(pages, tile.b, (j + 2) * KEYS)
+            } else {
+                0
+            };
             let (k_smem_base, v_smem_base) = if PAGED {
-                crate::device::varlen::paged::stage_kv_tile::<HD, KEYS, 128, false, false>(
-                    k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse, pages,
+                paged::stage_kv_tile::<HD, KEYS, 128, false, false>(
+                    k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse, pages, page,
+                    next_page,
                 )
             } else {
-                stage_kv_tile::<HD, KEYS, 128, false, false>(
-                    k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse,
-                )
+                if unroll_copy {
+                    stage_kv_tile::<HD, KEYS, 128, true, false>(
+                        k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse,
+                    )
+                } else {
+                    stage_kv_tile::<HD, KEYS, 128, false, false>(
+                        k, v, &cfg, &tile, &bases, kv_range, smem, layout, j, reverse,
+                    )
+                }
             };
             let mut s = [[0.0f32; 4]; NKT];
+
             compute_qk::<BF16, 1, NFQ, NKT>(&mut s, &q_frag, k_smem_base, &tile, layout);
+
             if !layout.double && !layout.triple {
-                // d64: one barrier finishes V staging and releases K.
-                if HD == 64 {
+                // One barrier can finish V staging and release the consumed K tile.
+                if HD == 64 || raw_scores {
                     ptx_asm!("cp.async.wait_group 0;", clobber("memory"));
                 }
                 thread::sync_threads();
                 if j + 1 < kv_range.num_tiles {
                     if PAGED {
-                        crate::device::varlen::paged::stage_tile::<HD, KEYS, 128>(
+                        paged::stage_tile::<HD, KEYS, 128>(
                             smem.k0,
                             k,
                             (j + 1) * KEYS,
+                            next_page,
                             bases.k,
                             cfg.k.seq,
                             cfg.k.batch,
@@ -242,35 +347,68 @@ unsafe fn core<
                             pages,
                         );
                     } else {
-                        stage_tile::<HD, KEYS, 128, false, false>(
-                            smem.k0,
-                            k,
-                            (j + 1) * KEYS,
-                            bases.k,
-                            cfg.k.seq,
-                            &cfg,
-                            &tile,
-                            layout,
-                        );
+                        if unroll_copy {
+                            stage_tile::<HD, KEYS, 128, true, false>(
+                                smem.k0,
+                                k,
+                                (j + 1) * KEYS,
+                                bases.k,
+                                cfg.k.seq,
+                                &cfg,
+                                &tile,
+                                layout,
+                            );
+                        } else {
+                            stage_tile::<HD, KEYS, 128, false, false>(
+                                smem.k0,
+                                k,
+                                (j + 1) * KEYS,
+                                bases.k,
+                                cfg.k.seq,
+                                &cfg,
+                                &tile,
+                                layout,
+                            );
+                        }
                     }
                     ptx_asm!("cp.async.commit_group;", clobber("memory"));
                 }
             }
-            apply_scores::<1, NKT, 64, KEYS>(
-                &mut s, &cfg, &tile, kv_base, off, scale, tanh_scale, slope,
-            );
             let mut p_pack = [[0u32; 2]; NKT];
-            online_softmax_pack::<BF16, 1, NKT, NFO>(
-                &s,
-                &mut p_pack,
-                &mut o_acc,
-                &mut m_row,
-                &mut l_row,
+
+            apply_scores::<1, NKT, 64, KEYS>(
+                &mut s,
+                &cfg,
+                &tile,
+                kv_base,
+                off,
+                if raw_scores { 1.0 } else { scale },
+                tanh_scale,
+                slope,
             );
+            if raw_scores {
+                online_softmax_pack_raw::<BF16, 1, NKT, NFO>(
+                    &s,
+                    &mut p_pack,
+                    &mut o_acc,
+                    &mut m_row,
+                    &mut l_row,
+                    scale,
+                );
+            } else {
+                online_softmax_pack::<BF16, 1, NKT, NFO>(
+                    &s,
+                    &mut p_pack,
+                    &mut o_acc,
+                    &mut m_row,
+                    &mut l_row,
+                );
+            }
             if DROPOUT {
                 dropout.apply::<1, NKT>(&mut p_pack, &tile, kv_base);
             }
-            if !layout.double && HD != 64 {
+
+            if (!layout.double && HD != 64 && !raw_scores) || (layout.triple && raw_scores) {
                 // V is the older committed group; next K may remain in flight.
                 if j + 1 < kv_range.num_tiles {
                     ptx_asm!("cp.async.wait_group 1;", clobber("memory"));
@@ -279,6 +417,7 @@ unsafe fn core<
                 }
                 thread::sync_threads();
             }
+
             accumulate_values::<BF16, 1, NKT, NFO, PV_CHUNKS>(
                 &mut o_acc,
                 &p_pack,
@@ -291,29 +430,54 @@ unsafe fn core<
             if layout.double {
                 thread::sync_threads();
             }
+            page = next_page;
+            next_page = after_next_page;
             j += 1;
         }
 
-        write_packed_output::<BF16, NFO, SPLIT>(
-            o,
-            lse,
-            &o_acc,
-            &m_row,
-            &l_row,
-            &cfg,
-            &tile,
-            &bases,
-            if SPLIT {
-                ((tile.b as usize * cache.splits as usize + split as usize) * cfg.h as usize
-                    + tile.head as usize)
-                    * query_rows as usize
-            } else if CACHED {
-                (tile.b as usize * cfg.h as usize + tile.head as usize) * cfg.seqlen_q as usize
-            } else {
-                tile.head as usize * total_q as usize + qs as usize
-            },
-            if DROPOUT { dropout.inv_keep } else { 1.0 },
-        );
+        if raw_scores {
+            m_row[0] *= scale;
+            m_row[1] *= scale;
+        }
+        let lse_base = if SPLIT {
+            ((tile.b as usize * cache.splits as usize + split as usize) * cfg.h as usize
+                + tile.head as usize)
+                * query_rows as usize
+        } else if CACHED {
+            (tile.b as usize * cfg.h as usize + tile.head as usize) * cfg.seqlen_q as usize
+        } else {
+            tile.head as usize * total_q as usize + qs as usize
+        };
+        let output_scale = if DROPOUT { dropout.inv_keep } else { 1.0 };
+        if VECTOR_OUTPUT {
+            write_output::<BF16, 1, NFO, false, 64, 128, true>(
+                o,
+                lse,
+                &o_acc,
+                &m_row,
+                &l_row,
+                &cfg,
+                &tile,
+                &bases,
+                smem.k0,
+                layout,
+                output_scale,
+                lse_base,
+            );
+        } else {
+            write_packed_output::<BF16, NFO, SPLIT>(
+                o,
+                lse,
+                &o_acc,
+                &m_row,
+                &l_row,
+                &cfg,
+                &tile,
+                &bases,
+                lse_base,
+                output_scale,
+            );
+        }
     }
 }
 
@@ -350,6 +514,9 @@ pub struct Varlen<
     const CACHED: bool,
     const SPLIT: bool = false,
     const GROUPED: bool = false,
+    const PAGE_SIZE: u32 = 0,
+    const CAUSAL256: bool = false,
+    const WIDE: bool = false,
 >;
 impl<
     const BF16: bool,
@@ -364,8 +531,27 @@ impl<
     const CACHED: bool,
     const SPLIT: bool,
     const GROUPED: bool,
+    const PAGE_SIZE: u32,
+    const CAUSAL256: bool,
+    const WIDE: bool,
 > Spec
-    for Varlen<BF16, HD, NFQ, NFO, KEYS, NKT, PV_CHUNKS, DROPOUT, PAGED, CACHED, SPLIT, GROUPED>
+    for Varlen<
+        BF16,
+        HD,
+        NFQ,
+        NFO,
+        KEYS,
+        NKT,
+        PV_CHUNKS,
+        DROPOUT,
+        PAGED,
+        CACHED,
+        SPLIT,
+        GROUPED,
+        PAGE_SIZE,
+        CAUSAL256,
+        WIDE,
+    >
 {
     #[inline(always)]
     unsafe fn run(
@@ -381,66 +567,77 @@ impl<
         leftpad: *const i32,
         total_q: u32,
         total_k: u32,
-        cfg: FwdConfig,
+        mut cfg: FwdConfig,
         dropout: Dropout,
-        pages: Pages,
+        mut pages: Pages,
         cache: Cache,
     ) {
+        if PAGE_SIZE != 0 {
+            pages.size = PAGE_SIZE;
+        }
+        // Both folded variants serve exact head dims without masks or ALiBi.
+        if WIDE {
+            cfg.hs_u32 = (HD / 2) as u32;
+            cfg.tanh_scale = 0.0;
+            cfg.has_alibi = 0;
+            cfg.alibi_causal = 0;
+            cfg.window_left = -1;
+            cfg.window_right = -1;
+        }
+        if CAUSAL256 {
+            cfg.hs_u32 = (HD / 2) as u32;
+            cfg.tanh_scale = 0.0;
+            cfg.has_alibi = 0;
+            cfg.alibi_causal = 0;
+            cfg.window_left = -1;
+            cfg.window_right = 0;
+        }
         unsafe {
-            core::<BF16, HD, NFQ, NFO, KEYS, NKT, PV_CHUNKS, DROPOUT, PAGED, CACHED, SPLIT, GROUPED>(
+            core::<
+                BF16,
+                HD,
+                NFQ,
+                NFO,
+                KEYS,
+                NKT,
+                PV_CHUNKS,
+                DROPOUT,
+                PAGED,
+                CACHED,
+                SPLIT,
+                GROUPED,
+                CAUSAL256,
+                WIDE,
+            >(
                 q, k, v, o, lse, alibi, cuq, cuk, used, leftpad, total_q, total_k, cfg, dropout,
                 pages, cache,
             );
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d32_dropout = Varlen<false, 32, 2, 4, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d32_bf16_dropout = Varlen<true, 32, 2, 4, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_dropout = Varlen<false, 64, 4, 8, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_bf16_dropout = Varlen<true, 64, 4, 8, 64, 8, 4, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_dropout = Varlen<false, 96, 6, 12, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_bf16_dropout = Varlen<true, 96, 6, 12, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_dropout = Varlen<false, 128, 8, 16, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_bf16_dropout = Varlen<true, 128, 8, 16, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_dropout = Varlen<false, 192, 12, 24, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_bf16_dropout = Varlen<true, 192, 12, 24, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_dropout = Varlen<false, 256, 16, 32, 32, 4, 2, true, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_bf16_dropout = Varlen<true, 256, 16, 32, 32, 4, 2, true, false, false>;
 #[kernel(
     d32,
@@ -796,75 +993,88 @@ unsafe fn write_packed_output<const BF16: bool, const NFO: usize, const PARTIAL:
     }
 }
 
-#[allow(non_camel_case_types)]
+// Causal prefill over 256-row pages: folded config and v2's split-KV key tiles.
+pub type paged_d32_causal256 =
+    Varlen<false, 32, 2, 4, 128, 16, 8, false, true, false, false, false, 256, true>;
+pub type paged_d32_causal256_bf16 =
+    Varlen<true, 32, 2, 4, 128, 16, 8, false, true, false, false, false, 256, true>;
 pub type paged_d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_dropout = Varlen<false, 32, 2, 4, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d32_bf16_dropout = Varlen<true, 32, 2, 4, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
+pub type paged_d64_causal256 =
+    Varlen<false, 64, 4, 8, 64, 8, 4, false, true, false, false, false, 256, true>;
+pub type paged_d64_causal256_bf16 =
+    Varlen<true, 64, 4, 8, 64, 8, 4, false, true, false, false, false, 256, true>;
 pub type paged_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_dropout = Varlen<false, 64, 4, 8, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d64_bf16_dropout = Varlen<true, 64, 4, 8, 64, 8, 4, true, true, false>;
-#[allow(non_camel_case_types)]
+pub type paged_d96_causal256 =
+    Varlen<false, 96, 6, 12, 128, 16, 8, false, true, false, false, false, 256, true>;
+pub type paged_d96_causal256_bf16 =
+    Varlen<true, 96, 6, 12, 128, 16, 8, false, true, false, false, false, 256, true>;
 pub type paged_d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_dropout = Varlen<false, 96, 6, 12, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d96_bf16_dropout = Varlen<true, 96, 6, 12, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
+pub type paged_d128_causal256 =
+    Varlen<false, 128, 8, 16, 128, 16, 8, false, true, false, false, false, 256, true>;
+pub type paged_d128_causal256_bf16 =
+    Varlen<true, 128, 8, 16, 128, 16, 8, false, true, false, false, false, 256, true>;
 pub type paged_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_dropout = Varlen<false, 128, 8, 16, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d128_bf16_dropout = Varlen<true, 128, 8, 16, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
+pub type paged_d192_causal256 =
+    Varlen<false, 192, 12, 24, 64, 8, 4, false, true, false, false, false, 256, true>;
+pub type paged_d192_causal256_bf16 =
+    Varlen<true, 192, 12, 24, 64, 8, 4, false, true, false, false, false, 256, true>;
 pub type paged_d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_dropout = Varlen<false, 192, 12, 24, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d192_bf16_dropout = Varlen<true, 192, 12, 24, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
+pub type paged_d256_causal256 =
+    Varlen<false, 256, 16, 32, 64, 8, 4, false, true, false, false, false, 256, true>;
+pub type paged_d256_causal256_bf16 =
+    Varlen<true, 256, 16, 32, 64, 8, 4, false, true, false, false, false, 256, true>;
 pub type paged_d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_dropout = Varlen<false, 256, 16, 32, 32, 4, 2, true, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, true, false>;
-#[allow(non_camel_case_types)]
 pub type paged_d256_bf16_dropout = Varlen<true, 256, 16, 32, 32, 4, 2, true, true, false>;
 #[kernel(
+    paged_d32_causal256,
+    paged_d32_causal256_bf16,
     paged_d32,
     paged_d32_dropout,
     paged_d32_bf16,
     paged_d32_bf16_dropout,
+    paged_d64_causal256,
+    paged_d64_causal256_bf16,
     paged_d64,
     paged_d64_dropout,
     paged_d64_bf16,
     paged_d64_bf16_dropout,
+    paged_d96_causal256,
+    paged_d96_causal256_bf16,
     paged_d96,
     paged_d96_dropout,
     paged_d96_bf16,
     paged_d96_bf16_dropout,
+    paged_d128_causal256,
+    paged_d128_causal256_bf16,
     paged_d128,
     paged_d128_dropout,
     paged_d128_bf16,
     paged_d128_bf16_dropout,
+    paged_d192_causal256,
+    paged_d192_causal256_bf16,
     paged_d192,
     paged_d192_dropout,
     paged_d192_bf16,
     paged_d192_bf16_dropout,
+    paged_d256_causal256,
+    paged_d256_causal256_bf16,
     paged_d256,
     paged_d256_dropout,
     paged_d256_bf16,
@@ -992,54 +1202,80 @@ pub fn paged_fwd<S: Spec>(
     }
 }
 
-#[allow(non_camel_case_types)]
 pub type cache_d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_paged = Varlen<false, 32, 2, 4, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d32_bf16_paged = Varlen<true, 32, 2, 4, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_paged = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d64_bf16_paged = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_paged = Varlen<false, 96, 6, 12, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d96_bf16_paged = Varlen<true, 96, 6, 12, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_paged = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d128_bf16_paged = Varlen<true, 128, 8, 16, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_paged = Varlen<false, 192, 12, 24, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d192_bf16_paged = Varlen<true, 192, 12, 24, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_paged = Varlen<false, 256, 16, 32, 32, 4, 2, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type cache_d256_bf16_paged = Varlen<true, 256, 16, 32, 32, 4, 2, false, true, true>;
+// Unsplit decode with v2's split-KV key tiles (256/128/64 by head dim), raw
+// scores and an optional fused append; grouped variants own one KV head.
+pub type cache_d32_wide =
+    Varlen<false, 32, 2, 4, 256, 32, 16, false, false, true, false, false, 0, false, true>;
+pub type cache_d32_wide_bf16 =
+    Varlen<true, 32, 2, 4, 256, 32, 16, false, false, true, false, false, 0, false, true>;
+pub type cache_d32_wide_grouped =
+    Varlen<false, 32, 2, 4, 256, 32, 16, false, false, true, false, true, 0, false, true>;
+pub type cache_d32_wide_grouped_bf16 =
+    Varlen<true, 32, 2, 4, 256, 32, 16, false, false, true, false, true, 0, false, true>;
+pub type cache_d64_wide =
+    Varlen<false, 64, 4, 8, 256, 32, 16, false, false, true, false, false, 0, false, true>;
+pub type cache_d64_wide_bf16 =
+    Varlen<true, 64, 4, 8, 256, 32, 16, false, false, true, false, false, 0, false, true>;
+pub type cache_d64_wide_grouped =
+    Varlen<false, 64, 4, 8, 256, 32, 16, false, false, true, false, true, 0, false, true>;
+pub type cache_d64_wide_grouped_bf16 =
+    Varlen<true, 64, 4, 8, 256, 32, 16, false, false, true, false, true, 0, false, true>;
+pub type cache_d96_wide =
+    Varlen<false, 96, 6, 12, 128, 16, 8, false, false, true, false, false, 0, false, true>;
+pub type cache_d96_wide_bf16 =
+    Varlen<true, 96, 6, 12, 128, 16, 8, false, false, true, false, false, 0, false, true>;
+pub type cache_d96_wide_grouped =
+    Varlen<false, 96, 6, 12, 128, 16, 8, false, false, true, false, true, 0, false, true>;
+pub type cache_d96_wide_grouped_bf16 =
+    Varlen<true, 96, 6, 12, 128, 16, 8, false, false, true, false, true, 0, false, true>;
+pub type cache_d128_wide =
+    Varlen<false, 128, 8, 16, 128, 16, 8, false, false, true, false, false, 0, false, true>;
+pub type cache_d128_wide_bf16 =
+    Varlen<true, 128, 8, 16, 128, 16, 8, false, false, true, false, false, 0, false, true>;
+pub type cache_d128_wide_grouped =
+    Varlen<false, 128, 8, 16, 128, 16, 8, false, false, true, false, true, 0, false, true>;
+pub type cache_d128_wide_grouped_bf16 =
+    Varlen<true, 128, 8, 16, 128, 16, 8, false, false, true, false, true, 0, false, true>;
+pub type cache_d192_wide =
+    Varlen<false, 192, 12, 24, 64, 8, 4, false, false, true, false, false, 0, false, true>;
+pub type cache_d192_wide_bf16 =
+    Varlen<true, 192, 12, 24, 64, 8, 4, false, false, true, false, false, 0, false, true>;
+pub type cache_d192_wide_grouped =
+    Varlen<false, 192, 12, 24, 64, 8, 4, false, false, true, false, true, 0, false, true>;
+pub type cache_d192_wide_grouped_bf16 =
+    Varlen<true, 192, 12, 24, 64, 8, 4, false, false, true, false, true, 0, false, true>;
+pub type cache_d256_wide =
+    Varlen<false, 256, 16, 32, 64, 8, 4, false, false, true, false, false, 0, false, true>;
+pub type cache_d256_wide_bf16 =
+    Varlen<true, 256, 16, 32, 64, 8, 4, false, false, true, false, false, 0, false, true>;
+pub type cache_d256_wide_grouped =
+    Varlen<false, 256, 16, 32, 64, 8, 4, false, false, true, false, true, 0, false, true>;
+pub type cache_d256_wide_grouped_bf16 =
+    Varlen<true, 256, 16, 32, 64, 8, 4, false, false, true, false, true, 0, false, true>;
 #[kernel(
     cache_d32,
     cache_d32_paged,
@@ -1064,13 +1300,37 @@ pub type cache_d256_bf16_paged = Varlen<true, 256, 16, 32, 32, 4, 2, false, true
     cache_d256,
     cache_d256_paged,
     cache_d256_bf16,
-    cache_d256_bf16_paged
+    cache_d256_bf16_paged,
+    cache_d32_wide,
+    cache_d32_wide_bf16,
+    cache_d32_wide_grouped,
+    cache_d32_wide_grouped_bf16,
+    cache_d64_wide,
+    cache_d64_wide_bf16,
+    cache_d64_wide_grouped,
+    cache_d64_wide_grouped_bf16,
+    cache_d96_wide,
+    cache_d96_wide_bf16,
+    cache_d96_wide_grouped,
+    cache_d96_wide_grouped_bf16,
+    cache_d128_wide,
+    cache_d128_wide_bf16,
+    cache_d128_wide_grouped,
+    cache_d128_wide_grouped_bf16,
+    cache_d192_wide,
+    cache_d192_wide_bf16,
+    cache_d192_wide_grouped,
+    cache_d192_wide_grouped_bf16,
+    cache_d256_wide,
+    cache_d256_wide_bf16,
+    cache_d256_wide_grouped,
+    cache_d256_wide_grouped_bf16
 )]
 #[launch_bounds(128)]
 pub fn cached_fwd<S: Spec>(
     q: &[u32],
-    k: &[u32],
-    v: &[u32],
+    k: DisjointSlice<u32>,
+    v: DisjointSlice<u32>,
     out: DisjointSlice<u32>,
     lse: DisjointSlice<f32>,
     alibi: &[f32],
@@ -1112,7 +1372,17 @@ pub fn cached_fwd<S: Spec>(
     cache_batches: u32,
     new_keys: u32,
     q_bs: u32,
+    append_k: &[u32],
+    append_v: &[u32],
+    append_k_bs: u32,
+    append_k_ss: u32,
+    append_k_hs: u32,
+    append_v_bs: u32,
+    append_v_ss: u32,
+    append_v_hs: u32,
 ) {
+    let mut k = k;
+    let mut v = v;
     let mut out = out;
     let mut lse = lse;
     let mut probabilities = probabilities;
@@ -1167,8 +1437,8 @@ pub fn cached_fwd<S: Spec>(
     unsafe {
         S::run(
             q.as_ptr(),
-            k.as_ptr(),
-            v.as_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
             out.as_mut_ptr(),
             lse.as_mut_ptr(),
             alibi.as_ptr(),
@@ -1192,89 +1462,65 @@ pub fn cached_fwd<S: Spec>(
                 batches: cache_batches,
                 new_keys,
                 splits: 1,
+                append_k: crate::device::inlined::optional_ptr(append_k),
+                append_v: crate::device::inlined::optional_ptr(append_v),
+                append_ks: crate::device::config::Strides {
+                    batch: append_k_bs,
+                    seq: append_k_ss,
+                    head: append_k_hs,
+                },
+                append_vs: crate::device::config::Strides {
+                    batch: append_v_bs,
+                    seq: append_v_ss,
+                    head: append_v_hs,
+                },
             },
         );
     }
 }
 
 // FP32 partial-output specializations for cached split-K attention.
-#[allow(non_camel_case_types)]
 pub type split_d32 = Varlen<false, 32, 2, 4, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_paged = Varlen<false, 32, 2, 4, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_bf16 = Varlen<true, 32, 2, 4, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_bf16_paged = Varlen<true, 32, 2, 4, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_paged = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_bf16_paged = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96 = Varlen<false, 96, 6, 12, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_paged = Varlen<false, 96, 6, 12, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_bf16 = Varlen<true, 96, 6, 12, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_bf16_paged = Varlen<true, 96, 6, 12, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_paged = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_bf16_paged = Varlen<true, 128, 8, 16, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192 = Varlen<false, 192, 12, 24, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_paged = Varlen<false, 192, 12, 24, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_bf16 = Varlen<true, 192, 12, 24, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_bf16_paged = Varlen<true, 192, 12, 24, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256 = Varlen<false, 256, 16, 32, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_paged = Varlen<false, 256, 16, 32, 32, 4, 2, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_bf16 = Varlen<true, 256, 16, 32, 32, 4, 2, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_bf16_paged = Varlen<true, 256, 16, 32, 32, 4, 2, false, true, true, true>;
 // Packed decode reuses the split core while reading cumulative lengths.
-#[allow(non_camel_case_types)]
 pub type packed_split_d64 = Varlen<false, 64, 4, 8, 64, 8, 4, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d64_paged = Varlen<false, 64, 4, 8, 64, 8, 4, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d64_bf16 = Varlen<true, 64, 4, 8, 64, 8, 4, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d64_bf16_paged = Varlen<true, 64, 4, 8, 64, 8, 4, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128 = Varlen<false, 128, 8, 16, 32, 4, 2, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128_paged = Varlen<false, 128, 8, 16, 32, 4, 2, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128_bf16 = Varlen<true, 128, 8, 16, 32, 4, 2, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_split_d128_bf16_paged =
     Varlen<true, 128, 8, 16, 32, 4, 2, false, true, false, true>;
 
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128 =
     Varlen<false, 128, 8, 16, 32, 4, 2, false, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128_paged =
     Varlen<false, 128, 8, 16, 32, 4, 2, false, true, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128_bf16 =
     Varlen<true, 128, 8, 16, 32, 4, 2, false, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type packed_grouped_split_d128_bf16_paged =
     Varlen<true, 128, 8, 16, 32, 4, 2, false, true, false, true, true>;
 
@@ -1443,6 +1689,7 @@ pub fn cached_split_fwd<S: Spec>(
                 batches: cache_batches,
                 new_keys,
                 splits,
+                ..Cache::NONE
             },
         );
     }

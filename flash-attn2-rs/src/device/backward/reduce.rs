@@ -10,9 +10,7 @@ pub struct Merge<const BF16: bool>;
 impl<const BF16: bool> MergeSpec for Merge<BF16> {
     const BF16: bool = BF16;
 }
-#[allow(non_camel_case_types)]
 pub type f16 = Merge<false>;
-#[allow(non_camel_case_types)]
 pub type bf16 = Merge<true>;
 
 pub trait ReduceSpec {
@@ -24,18 +22,28 @@ impl<const BF16: bool, const LANES: u32> ReduceSpec for Reduce<BF16, LANES> {
     const BF16: bool = BF16;
     const LANES: u32 = LANES;
 }
-#[allow(non_camel_case_types)]
 pub type f16_8 = Reduce<false, 8>;
-#[allow(non_camel_case_types)]
 pub type f16_16 = Reduce<false, 16>;
-#[allow(non_camel_case_types)]
 pub type f16_32 = Reduce<false, 32>;
-#[allow(non_camel_case_types)]
 pub type bf16_8 = Reduce<true, 8>;
-#[allow(non_camel_case_types)]
 pub type bf16_16 = Reduce<true, 16>;
-#[allow(non_camel_case_types)]
 pub type bf16_32 = Reduce<true, 32>;
+
+#[inline(always)]
+unsafe fn load_four(ptr: *const u32) -> [u32; 4] {
+    let a: u32;
+    let b: u32;
+    let c: u32;
+    let d: u32;
+    unsafe {
+        cuda_device::ptx_asm!(
+            "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];",
+            out("=r") a, out("=r") b, out("=r") c, out("=r") d,
+            in("l") ptr, clobber("memory")
+        );
+    }
+    [a, b, c, d]
+}
 
 #[kernel(f16_8, f16_16, f16_32, bf16_8, bf16_16, bf16_32)]
 #[launch_bounds(256)]
@@ -54,45 +62,106 @@ pub fn bwd_preprocess<S: ReduceSpec>(
     out_seq: u32,
     out_head: u32,
     keep: f32,
+    accum: *mut f32,
+    accum_rows: u32,
 ) {
     let mut delta = delta;
     let tid = thread::threadIdx_x();
-    let row = thread::blockIdx_x() as u64 * (256 / S::LANES) as u64 + (tid / S::LANES) as u64;
-    // rounded_seq is a multiple of 128, so every launched subgroup is valid.
-    let s = row % rounded_seq as u64;
-    let h = row / rounded_seq as u64 % heads as u64;
-    let b = row / (rounded_seq as u64 * heads as u64);
+    // Clear this block's rows of the fused dQ accumulator, [b, rows, h, d]
+    // in FP32, saving the separate memset launch.
+    if !accum.is_null() {
+        let rows = 256 / S::LANES as usize;
+        let first = thread::blockIdx_x() as usize * rows;
+        let width = dim_pairs as usize * 2;
+        let base = ((thread::blockIdx_z() as usize * accum_rows as usize + first) * heads as usize
+            + thread::blockIdx_y() as usize)
+            * width;
+        let row_stride = heads as usize * width;
+        let mut i = tid as usize * 4;
+        while i < rows * width {
+            let row = i / width;
+            if first + row < accum_rows as usize {
+                unsafe {
+                    let ptr = accum.add(base + row * row_stride + i % width);
+                    cuda_device::ptx_asm!(
+                        "st.global.v4.f32 [%0], {%1, %1, %1, %1};",
+                        in("l") ptr as u64, in("f") 0.0f32, clobber("memory")
+                    );
+                }
+            }
+            i += 1024;
+        }
+    }
+    // Keep sequence blocks fastest in the grid, followed by head and batch.
+    // Direct coordinates avoid dividing a flattened row index in every thread.
+    let s = thread::blockIdx_x() as u64 * (256 / S::LANES) as u64 + (tid / S::LANES) as u64;
+    let h = thread::blockIdx_y() as u64;
+    let b = thread::blockIdx_z() as u64;
+    let row = (b * heads as u64 + h) * rounded_seq as u64 + s;
     let lane = tid % S::LANES;
     let mut sum = 0.0f32;
     if s < seq as u64 {
         let a_base = b * do_batch as u64 + s * do_seq as u64 + h * do_head as u64;
         let b_base = b * out_batch as u64 + s * out_seq as u64 + h * out_head as u64;
-        let mut d = lane;
-        while d < dim_pairs {
-            let (a, b) = unsafe {
-                (
-                    *dout.as_ptr().add((a_base + d as u64) as usize),
-                    *out.as_ptr().add((b_base + d as u64) as usize),
-                )
-            };
-            let (a0, a1, b0, b1) = if S::BF16 {
-                (
-                    unpack::<true>(a),
-                    unpack::<true>(a >> 16),
-                    unpack::<true>(b),
-                    unpack::<true>(b >> 16),
-                )
-            } else {
-                (
-                    unpack::<false>(a),
-                    unpack::<false>(a >> 16),
-                    unpack::<false>(b),
-                    unpack::<false>(b >> 16),
-                )
-            };
-            sum += a0 * b0;
-            sum += a1 * b1;
-            d += S::LANES;
+        let ap = unsafe { dout.as_ptr().add(a_base as usize) };
+        let bp = unsafe { out.as_ptr().add(b_base as usize) };
+        // Eight lanes cover D64 with one aligned 16-byte load per input.
+        // Unaligned rows and other dimensions retain the scalar path.
+        if S::LANES == 8 && dim_pairs == 32 && ((ap as usize | bp as usize) & 15) == 0 {
+            let aa = unsafe { load_four(ap.add(lane as usize * 4)) };
+            let bb = unsafe { load_four(bp.add(lane as usize * 4)) };
+            let mut i = 0;
+            while i < 4 {
+                thread::__unroll_config::<0>();
+                let a = aa[i];
+                let b = bb[i];
+                let (a0, a1, b0, b1) = if S::BF16 {
+                    (
+                        unpack::<true>(a),
+                        unpack::<true>(a >> 16),
+                        unpack::<true>(b),
+                        unpack::<true>(b >> 16),
+                    )
+                } else {
+                    (
+                        unpack::<false>(a),
+                        unpack::<false>(a >> 16),
+                        unpack::<false>(b),
+                        unpack::<false>(b >> 16),
+                    )
+                };
+                sum += a0 * b0;
+                sum += a1 * b1;
+                i += 1;
+            }
+        } else {
+            let mut d = lane;
+            while d < dim_pairs {
+                let (a, b) = unsafe {
+                    (
+                        *dout.as_ptr().add((a_base + d as u64) as usize),
+                        *out.as_ptr().add((b_base + d as u64) as usize),
+                    )
+                };
+                let (a0, a1, b0, b1) = if S::BF16 {
+                    (
+                        unpack::<true>(a),
+                        unpack::<true>(a >> 16),
+                        unpack::<true>(b),
+                        unpack::<true>(b >> 16),
+                    )
+                } else {
+                    (
+                        unpack::<false>(a),
+                        unpack::<false>(a >> 16),
+                        unpack::<false>(b),
+                        unpack::<false>(b >> 16),
+                    )
+                };
+                sum += a0 * b0;
+                sum += a1 * b1;
+                d += S::LANES;
+            }
         }
     }
     let mut distance = S::LANES / 2;

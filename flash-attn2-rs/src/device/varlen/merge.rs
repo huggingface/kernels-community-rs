@@ -17,23 +17,15 @@ impl<const BF16: bool, const GROUPED: bool, const PACKED: bool> Spec
     const GROUPED: bool = GROUPED;
     const PACKED: bool = PACKED;
 }
-#[allow(non_camel_case_types)]
 pub type f16 = Merge<false>;
-#[allow(non_camel_case_types)]
 pub type bf16 = Merge<true>;
 
-#[allow(non_camel_case_types)]
 pub type grouped_f16 = Merge<false, true>;
-#[allow(non_camel_case_types)]
 pub type grouped_bf16 = Merge<true, true>;
 
-#[allow(non_camel_case_types)]
 pub type packed_f16 = Merge<false, false, true>;
-#[allow(non_camel_case_types)]
 pub type packed_bf16 = Merge<true, false, true>;
-#[allow(non_camel_case_types)]
 pub type grouped_packed_f16 = Merge<false, true, true>;
-#[allow(non_camel_case_types)]
 pub type grouped_packed_bf16 = Merge<true, true, true>;
 
 #[kernel(

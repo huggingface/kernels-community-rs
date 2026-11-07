@@ -1,4 +1,4 @@
-use super::dkv::dkv_both_core;
+use super::generic::*;
 use crate::device::config::{FwdConfig, Strides};
 use crate::device::dropout::Dropout;
 use cuda_device::{DisjointSlice, kernel, launch_bounds};
@@ -23,266 +23,157 @@ pub trait FusedSpec {
         dropout: Dropout,
     );
 }
-pub struct Fused<
-    const BF16: bool,
-    const DROP: bool,
-    const PARTIAL: bool,
-    const MODE: u32 = 2,
-    const HD: usize = 128,
-    const NFQ: usize = 8,
-    const NFO: usize = 16,
-    const KSTRIDE: usize = 64,
->;
-impl<
-    const BF16: bool,
-    const DROP: bool,
-    const PARTIAL: bool,
-    const MODE: u32,
-    const HD: usize,
-    const NFQ: usize,
-    const NFO: usize,
-    const KSTRIDE: usize,
-> FusedSpec for Fused<BF16, DROP, PARTIAL, MODE, HD, NFQ, NFO, KSTRIDE>
-{
-    const DROPOUT: bool = DROP;
-    const MODE: u32 = MODE;
-    #[inline(always)]
-    unsafe fn run(
-        q: *const u32,
-        k: *const u32,
-        v: *const u32,
-        dout: *const u32,
-        lse: *const f32,
-        delta: *const f32,
-        dk: *mut u32,
-        dv: *mut u32,
-        dq: *mut f32,
-        alibi: *const f32,
-        cfg: FwdConfig,
-        do_strides: Strides,
-        gradient_scale: f32,
-        dropout: Dropout,
-    ) {
-        unsafe {
-            dkv_both_core::<BF16, HD, NFQ, NFO, PARTIAL, DROP, false, true, MODE, KSTRIDE>(
-                q,
-                k,
-                v,
-                dout,
-                lse,
-                delta,
-                dk,
-                dv,
-                dq,
-                alibi,
-                cfg,
-                do_strides,
-                gradient_scale,
-                dropout,
-            );
-        }
-    }
-}
-#[allow(non_camel_case_types)]
-pub type fused_f16 = Fused<false, false, false>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_partial = Fused<false, false, true>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop = Fused<false, true, false>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_partial = Fused<false, true, true>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16 = Fused<true, false, false>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_partial = Fused<true, false, true>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop = Fused<true, true, false>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_partial = Fused<true, true, true>;
-
-#[allow(non_camel_case_types)]
-pub type fused_f16_plain = Fused<false, false, false, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_partial_plain = Fused<false, false, true, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_plain = Fused<false, true, false, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_partial_plain = Fused<false, true, true, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_plain = Fused<true, false, false, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_partial_plain = Fused<true, false, true, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_plain = Fused<true, true, false, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_partial_plain = Fused<true, true, true, 0>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_causal = Fused<false, false, false, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_partial_causal = Fused<false, false, true, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_causal = Fused<false, true, false, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_partial_causal = Fused<false, true, true, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_causal = Fused<true, false, false, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_partial_causal = Fused<true, false, true, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_causal = Fused<true, true, false, 1>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_partial_causal = Fused<true, true, true, 1>;
-
-#[allow(non_camel_case_types)]
-pub type fused_f16_causal_balanced = Fused<false, false, false, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_partial_causal_balanced = Fused<false, false, true, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_causal_balanced = Fused<false, true, false, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_f16_drop_partial_causal_balanced = Fused<false, true, true, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_causal_balanced = Fused<true, false, false, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_partial_causal_balanced = Fused<true, false, true, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_causal_balanced = Fused<true, true, false, 3>;
-#[allow(non_camel_case_types)]
-pub type fused_bf16_drop_partial_causal_balanced = Fused<true, true, true, 3>;
-
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16 = Fused<false, false, false, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_partial = Fused<false, false, true, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop = Fused<false, true, false, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_partial = Fused<false, true, true, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16 = Fused<true, false, false, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_partial = Fused<true, false, true, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop = Fused<true, true, false, 2, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_partial = Fused<true, true, true, 2, 64, 4, 8, 32>;
-
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_plain = Fused<false, false, false, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_partial_plain = Fused<false, false, true, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_plain = Fused<false, true, false, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_partial_plain = Fused<false, true, true, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_plain = Fused<true, false, false, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_partial_plain = Fused<true, false, true, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_plain = Fused<true, true, false, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_partial_plain = Fused<true, true, true, 0, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_causal = Fused<false, false, false, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_partial_causal = Fused<false, false, true, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_causal = Fused<false, true, false, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_partial_causal = Fused<false, true, true, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_causal = Fused<true, false, false, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_partial_causal = Fused<true, false, true, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_causal = Fused<true, true, false, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_partial_causal = Fused<true, true, true, 1, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_causal_balanced = Fused<false, false, false, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_partial_causal_balanced = Fused<false, false, true, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_causal_balanced = Fused<false, true, false, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_f16_drop_partial_causal_balanced = Fused<false, true, true, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_causal_balanced = Fused<true, false, false, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_partial_causal_balanced = Fused<true, false, true, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_causal_balanced = Fused<true, true, false, 3, 64, 4, 8, 32>;
-#[allow(non_camel_case_types)]
-pub type fused_d64_bf16_drop_partial_causal_balanced = Fused<true, true, true, 3, 64, 4, 8, 32>;
-
 #[kernel(
-    fused_d64_f16_plain,
-    fused_d64_f16_partial_plain,
-    fused_d64_f16_drop_plain,
-    fused_d64_f16_drop_partial_plain,
-    fused_d64_bf16_plain,
-    fused_d64_bf16_partial_plain,
-    fused_d64_bf16_drop_plain,
-    fused_d64_bf16_drop_partial_plain,
-    fused_d64_f16_causal,
-    fused_d64_f16_partial_causal,
-    fused_d64_f16_drop_causal,
-    fused_d64_f16_drop_partial_causal,
-    fused_d64_bf16_causal,
-    fused_d64_bf16_partial_causal,
-    fused_d64_bf16_drop_causal,
-    fused_d64_bf16_drop_partial_causal,
-    fused_d64_f16_causal_balanced,
-    fused_d64_f16_partial_causal_balanced,
-    fused_d64_f16_drop_causal_balanced,
-    fused_d64_f16_drop_partial_causal_balanced,
-    fused_d64_bf16_causal_balanced,
-    fused_d64_bf16_partial_causal_balanced,
-    fused_d64_bf16_drop_causal_balanced,
-    fused_d64_bf16_drop_partial_causal_balanced,
-    fused_d64_f16,
-    fused_d64_f16_partial,
-    fused_d64_f16_drop,
-    fused_d64_f16_drop_partial,
-    fused_d64_bf16,
-    fused_d64_bf16_partial,
-    fused_d64_bf16_drop,
-    fused_d64_bf16_drop_partial,
-    fused_f16,
-    fused_f16_partial,
-    fused_f16_drop,
-    fused_f16_drop_partial,
-    fused_bf16,
-    fused_bf16_partial,
-    fused_bf16_drop,
-    fused_bf16_drop_partial,
-    fused_f16_plain,
-    fused_f16_partial_plain,
-    fused_f16_drop_plain,
-    fused_f16_drop_partial_plain,
-    fused_bf16_plain,
-    fused_bf16_partial_plain,
-    fused_bf16_drop_plain,
-    fused_bf16_drop_partial_plain,
-    fused_f16_causal,
-    fused_f16_partial_causal,
-    fused_f16_drop_causal,
-    fused_f16_drop_partial_causal,
-    fused_bf16_causal,
-    fused_bf16_partial_causal,
-    fused_bf16_drop_causal,
-    fused_bf16_drop_partial_causal,
-    fused_f16_causal_balanced,
-    fused_f16_partial_causal_balanced,
-    fused_f16_drop_causal_balanced,
-    fused_f16_drop_partial_causal_balanced,
-    fused_bf16_causal_balanced,
-    fused_bf16_partial_causal_balanced,
-    fused_bf16_drop_causal_balanced,
-    fused_bf16_drop_partial_causal_balanced
+    generic_d192_f16_plain,
+    generic_d192_f16_causal,
+    generic_d192_f16_masked,
+    generic_d192_f16_partial_plain,
+    generic_d192_f16_partial_causal,
+    generic_d192_f16_partial_masked,
+    generic_d192_f16_drop_plain,
+    generic_d192_f16_drop_causal,
+    generic_d192_f16_drop_masked,
+    generic_d192_f16_drop_partial_plain,
+    generic_d192_f16_drop_partial_causal,
+    generic_d192_f16_drop_partial_masked,
+    generic_d192_bf16_plain,
+    generic_d192_bf16_causal,
+    generic_d192_bf16_masked,
+    generic_d192_bf16_partial_plain,
+    generic_d192_bf16_partial_causal,
+    generic_d192_bf16_partial_masked,
+    generic_d192_bf16_drop_plain,
+    generic_d192_bf16_drop_causal,
+    generic_d192_bf16_drop_masked,
+    generic_d192_bf16_drop_partial_plain,
+    generic_d192_bf16_drop_partial_causal,
+    generic_d192_bf16_drop_partial_masked,
+    generic_d256_f16_drop_plain,
+    generic_d256_f16_drop_causal,
+    generic_d256_f16_drop_masked,
+    generic_d256_f16_drop_partial_plain,
+    generic_d256_f16_drop_partial_causal,
+    generic_d256_f16_drop_partial_masked,
+    generic_d256_bf16_drop_plain,
+    generic_d256_bf16_drop_causal,
+    generic_d256_bf16_drop_masked,
+    generic_d256_bf16_drop_partial_plain,
+    generic_d256_bf16_drop_partial_causal,
+    generic_d256_bf16_drop_partial_masked,
+    generic_d256_f16_plain,
+    generic_d256_f16_causal,
+    generic_d256_f16_masked,
+    generic_d256_f16_partial_plain,
+    generic_d256_f16_partial_causal,
+    generic_d256_f16_partial_masked,
+    generic_d256_bf16_plain,
+    generic_d256_bf16_causal,
+    generic_d256_bf16_masked,
+    generic_d256_bf16_partial_plain,
+    generic_d256_bf16_partial_causal,
+    generic_d256_bf16_partial_masked,
+    generic_d32_f16_plain,
+    generic_d32_f16_wide,
+    generic_d32_bf16_wide,
+    generic_d32_f16_partial_wide,
+    generic_d32_bf16_partial_wide,
+    generic_d32_f16_causal,
+    generic_d32_f16_masked,
+    generic_d32_f16_partial_plain,
+    generic_d32_f16_partial_causal,
+    generic_d32_f16_partial_masked,
+    generic_d32_f16_drop_plain,
+    generic_d32_f16_drop_causal,
+    generic_d32_f16_drop_masked,
+    generic_d32_f16_drop_partial_plain,
+    generic_d32_f16_drop_partial_causal,
+    generic_d32_f16_drop_partial_masked,
+    generic_d32_bf16_plain,
+    generic_d32_bf16_causal,
+    generic_d32_bf16_masked,
+    generic_d32_bf16_partial_plain,
+    generic_d32_bf16_partial_causal,
+    generic_d32_bf16_partial_masked,
+    generic_d32_bf16_drop_plain,
+    generic_d32_bf16_drop_causal,
+    generic_d32_bf16_drop_masked,
+    generic_d32_bf16_drop_partial_plain,
+    generic_d32_bf16_drop_partial_causal,
+    generic_d32_bf16_drop_partial_masked,
+    generic_d64_f16_plain,
+    generic_d64_f16_causal,
+    generic_d64_f16_masked,
+    generic_d64_f16_partial_plain,
+    generic_d64_f16_partial_causal,
+    generic_d64_f16_partial_masked,
+    generic_d64_f16_drop_plain,
+    generic_d64_f16_drop_causal,
+    generic_d64_f16_drop_masked,
+    generic_d64_f16_drop_partial_plain,
+    generic_d64_f16_drop_partial_causal,
+    generic_d64_f16_drop_partial_masked,
+    generic_d64_bf16_plain,
+    generic_d64_bf16_causal,
+    generic_d64_bf16_masked,
+    generic_d64_bf16_partial_plain,
+    generic_d64_bf16_partial_causal,
+    generic_d64_bf16_partial_masked,
+    generic_d64_bf16_drop_plain,
+    generic_d64_bf16_drop_causal,
+    generic_d64_bf16_drop_masked,
+    generic_d64_bf16_drop_partial_plain,
+    generic_d64_bf16_drop_partial_causal,
+    generic_d64_bf16_drop_partial_masked,
+    generic_d96_f16_plain,
+    generic_d96_f16_causal,
+    generic_d96_f16_masked,
+    generic_d96_f16_partial_plain,
+    generic_d96_f16_partial_causal,
+    generic_d96_f16_partial_masked,
+    generic_d96_f16_drop_plain,
+    generic_d96_f16_drop_causal,
+    generic_d96_f16_drop_masked,
+    generic_d96_f16_drop_partial_plain,
+    generic_d96_f16_drop_partial_causal,
+    generic_d96_f16_drop_partial_masked,
+    generic_d96_bf16_plain,
+    generic_d96_bf16_causal,
+    generic_d96_bf16_masked,
+    generic_d96_bf16_partial_plain,
+    generic_d96_bf16_partial_causal,
+    generic_d96_bf16_partial_masked,
+    generic_d96_bf16_drop_plain,
+    generic_d96_bf16_drop_causal,
+    generic_d96_bf16_drop_masked,
+    generic_d96_bf16_drop_partial_plain,
+    generic_d96_bf16_drop_partial_causal,
+    generic_d96_bf16_drop_partial_masked,
+    generic_d128_f16_plain,
+    generic_d128_f16_causal,
+    generic_d128_f16_masked,
+    generic_d128_f16_partial_plain,
+    generic_d128_f16_partial_causal,
+    generic_d128_f16_partial_masked,
+    generic_d128_f16_drop_plain,
+    generic_d128_f16_drop_causal,
+    generic_d128_f16_drop_masked,
+    generic_d128_f16_drop_partial_plain,
+    generic_d128_f16_drop_partial_causal,
+    generic_d128_f16_drop_partial_masked,
+    generic_d128_bf16_plain,
+    generic_d128_bf16_causal,
+    generic_d128_bf16_masked,
+    generic_d128_bf16_partial_plain,
+    generic_d128_bf16_partial_causal,
+    generic_d128_bf16_partial_masked,
+    generic_d128_bf16_drop_plain,
+    generic_d128_bf16_drop_causal,
+    generic_d128_bf16_drop_masked,
+    generic_d128_bf16_drop_partial_plain,
+    generic_d128_bf16_drop_partial_causal,
+    generic_d128_bf16_drop_partial_masked
 )]
-#[launch_bounds(128)]
+#[launch_bounds(256)]
 pub fn fused_backward<S: FusedSpec>(
     q: &[u32],
     k: &[u32],
@@ -332,7 +223,7 @@ pub fn fused_backward<S: FusedSpec>(
         if S::MODE == 2 { window_left } else { -1 },
         if S::MODE == 0 {
             -1
-        } else if S::MODE == 1 || S::MODE == 3 {
+        } else if S::MODE == 1 {
             0
         } else {
             window_right

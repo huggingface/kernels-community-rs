@@ -13,13 +13,9 @@ impl<const BF16: bool, const APPEND: bool> Spec for Copy<BF16, APPEND> {
     const APPEND: bool = APPEND;
     type Query = Copy<BF16, false>;
 }
-#[allow(non_camel_case_types)]
 pub type q_f16 = Copy<false, false>;
-#[allow(non_camel_case_types)]
 pub type q_bf16 = Copy<true, false>;
-#[allow(non_camel_case_types)]
 pub type kv_f16 = Copy<false, true>;
-#[allow(non_camel_case_types)]
 pub type kv_bf16 = Copy<true, true>;
 
 #[inline(always)]

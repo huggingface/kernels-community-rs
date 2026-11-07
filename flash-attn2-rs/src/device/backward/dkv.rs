@@ -1,7 +1,6 @@
 use super::common::{
-    copy_rows, copy_rows_swizzled, fused_dq_tile, fused_dq_tile_d64, fused_store_ds,
-    probability_gradient, query_fragments, query_fragments_swizzled, transposed_keep,
-    transposed_paired_words, transposed_word_mask,
+    copy_rows, copy_rows_swizzled, probability_gradient, query_fragments, query_fragments_swizzled,
+    transposed_keep,
 };
 use crate::device::config::{FwdConfig, LaunchTile, Strides};
 use crate::device::dropout::Dropout;
@@ -265,7 +264,7 @@ unsafe fn dkv_core<
     }
 }
 #[inline(always)]
-pub(super) unsafe fn dkv_both_core<
+pub(crate) unsafe fn dkv_both_core<
     const BF16: bool,
     const HD: usize,
     const NFQ: usize,
@@ -273,8 +272,6 @@ pub(super) unsafe fn dkv_both_core<
     const PARTIAL: bool,
     const DROPOUT: bool,
     const PLAIN: bool,
-    const FUSED: bool,
-    const ORDER: u32,
     const KSTRIDE: usize,
 >(
     q: *const u32,
@@ -285,29 +282,28 @@ pub(super) unsafe fn dkv_both_core<
     delta: *const f32,
     dk: *mut u32,
     dv: *mut u32,
-    dq: *mut f32,
     alibi: *const f32,
     cfg: FwdConfig,
     do_strides: Strides,
     gradient_scale: f32,
     dropout: Dropout,
+    packed_strides: Option<(u32, u32)>,
 ) {
     unsafe {
         let tid = thread::threadIdx_x();
         let lane = tid % 32;
-        let b = thread::blockIdx_z();
+        let b = if packed_strides.is_some() {
+            0
+        } else {
+            thread::blockIdx_z()
+        };
         let output_head = thread::blockIdx_y();
         let kh = if PARTIAL {
             output_head / cfg.gqa
         } else {
             output_head
         };
-        let key_block = if ORDER == 3 && b % 2 == 1 {
-            cfg.seqlen_k.div_ceil(64) - 1 - thread::blockIdx_x()
-        } else {
-            thread::blockIdx_x()
-        };
-        let key_start = key_block * 64;
+        let key_start = thread::blockIdx_x() * 64;
         let mut tile = LaunchTile {
             tid,
             lane_id: lane,
@@ -325,7 +321,7 @@ pub(super) unsafe fn dkv_both_core<
         let scratch = DynamicSharedArray::<u32, 16>::get() as usize as *mut u32;
         let mut k_frag = [[0u32; 4]; NFQ];
         let mut v_frag = [[0u32; 4]; NFQ];
-        let (q_shared, do_shared) = if FUSED || DROPOUT || !PLAIN {
+        let (q_shared, do_shared) = if DROPOUT || !PLAIN {
             // K/V stay in shared memory to free registers before Philox.
             copy_rows_swizzled::<64, KSTRIDE>(
                 k,
@@ -392,7 +388,8 @@ pub(super) unsafe fn dkv_both_core<
             thread::sync_threads();
             (scratch, scratch.add(32 * layout.stride))
         };
-        let rounded_q = cfg.seqlen_q.div_ceil(128) * 128;
+        let (lse_stride, rounded_q) =
+            packed_strides.unwrap_or((cfg.seqlen_q, cfg.seqlen_q.div_ceil(128) * 128));
         // Restrict the query loop to tiles that can attend to this key tile.
         let off = cfg.seqlen_k as i64 - cfg.seqlen_q as i64;
         let first = if cfg.window_right >= 0 {
@@ -458,7 +455,7 @@ pub(super) unsafe fn dkv_both_core<
                 );
                 thread::sync_threads();
                 let mut scores = [[0.0f32; 4]; 4];
-                if FUSED || DROPOUT || !PLAIN {
+                if DROPOUT || !PLAIN {
                     let fragments = query_fragments_swizzled::<NFQ, KSTRIDE>(scratch, &tile);
                     compute_qk::<BF16, 1, NFQ, 4>(&mut scores, &fragments, q_shared, &tile, layout);
                 } else {
@@ -469,12 +466,12 @@ pub(super) unsafe fn dkv_both_core<
                     thread::__unroll_config::<0>();
                     let query = query_start + nt as u32 * 8 + tile.pair * 2;
                     let l0 = if query < cfg.seqlen_q {
-                        *lse.add(tile.bh as usize * cfg.seqlen_q as usize + query as usize)
+                        *lse.add(tile.bh as usize * lse_stride as usize + query as usize)
                     } else {
                         f32::INFINITY
                     };
                     let l1 = if query + 1 < cfg.seqlen_q {
-                        *lse.add(tile.bh as usize * cfg.seqlen_q as usize + query as usize + 1)
+                        *lse.add(tile.bh as usize * lse_stride as usize + query as usize + 1)
                     } else {
                         f32::INFINITY
                     };
@@ -500,20 +497,11 @@ pub(super) unsafe fn dkv_both_core<
                     }
                     let mut packed_k = [[0u32; 2]; 4];
                     let mut packed_v = [[0u32; 2]; 4];
-                    // 8-query fragments pick different bytes of the same words.
-                    let mut mask_words = [0u32; 4];
                     nt = 0;
                     while nt < 4 {
                         thread::__unroll_config::<0>();
                         let query = query_start + nt as u32 * 8 + tile.pair * 2;
-                        let mask = if FUSED {
-                            if nt % 2 == 0 {
-                                mask_words = transposed_paired_words(dropout, tile.bh, query, key);
-                            }
-                            transposed_word_mask(mask_words, dropout.threshold, query, key)
-                        } else {
-                            transposed_keep(dropout, tile.bh, query, key)
-                        };
+                        let mask = transposed_keep(dropout, tile.bh, query, key);
                         let d0 = *delta.add(tile.bh as usize * rounded_q as usize + query as usize);
                         let d1 =
                             *delta.add(tile.bh as usize * rounded_q as usize + query as usize + 1);
@@ -541,11 +529,6 @@ pub(super) unsafe fn dkv_both_core<
                     accumulate_values::<BF16, 1, 4, NFO, 2>(
                         &mut acc_k, &packed_k, q_shared, &tile, layout,
                     );
-                    if FUSED {
-                        // Q/dOut are dead for every warp before dS replaces Q.
-                        thread::sync_threads();
-                        fused_store_ds(&packed_k, q_shared, tid);
-                    }
                 } else {
                     let mut packed = [[0u32; 2]; 4];
                     nt = 0;
@@ -559,7 +542,7 @@ pub(super) unsafe fn dkv_both_core<
                         &mut acc_v, &packed, do_shared, &tile, layout,
                     );
                     let mut dp = [[0.0f32; 4]; 4];
-                    if FUSED || !PLAIN {
+                    if !PLAIN {
                         let fragments = query_fragments_swizzled::<NFQ, KSTRIDE>(
                             scratch.add(64 * KSTRIDE),
                             &tile,
@@ -591,26 +574,6 @@ pub(super) unsafe fn dkv_both_core<
                     accumulate_values::<BF16, 1, 4, NFO, 2>(
                         &mut acc_k, &packed, q_shared, &tile, layout,
                     );
-                    if FUSED {
-                        // Q/dOut are dead for every warp before dS replaces Q.
-                        thread::sync_threads();
-                        fused_store_ds(&packed, q_shared, tid);
-                    }
-                }
-                if FUSED {
-                    thread::sync_threads();
-                    if HD == 128 {
-                        fused_dq_tile::<BF16>(scratch, q_shared, dq, &cfg, &tile, query_start);
-                    } else {
-                        fused_dq_tile_d64::<BF16, HD, NFQ, KSTRIDE>(
-                            scratch,
-                            q_shared,
-                            dq,
-                            &cfg,
-                            &tile,
-                            query_start,
-                        );
-                    }
                 }
                 thread::sync_threads();
                 block += 1;
@@ -750,7 +713,7 @@ impl<
     ) {
         unsafe {
             if BOTH {
-                dkv_both_core::<BF16, HD, NFQ, NFO, PARTIAL, DROPOUT, PLAIN, false, 0, 64>(
+                dkv_both_core::<BF16, HD, NFQ, NFO, PARTIAL, DROPOUT, PLAIN, 64>(
                     q,
                     k,
                     v,
@@ -759,12 +722,12 @@ impl<
                     delta,
                     dk,
                     dv,
-                    core::ptr::null_mut(),
                     alibi,
                     cfg,
                     do_strides,
                     gradient_scale,
                     dropout,
+                    None,
                 );
                 return;
             }
@@ -786,81 +749,43 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type dkv_d32 = Dkv<false, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type dkv_d32_bf16 = Dkv<true, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64 = Dkv<false, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type dkv_d64_bf16 = Dkv<true, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96 = Dkv<false, 96, 6, 12>;
-#[allow(non_camel_case_types)]
 pub type dkv_d96_bf16 = Dkv<true, 96, 6, 12>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128 = Dkv<false, 128, 8, 16>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_bf16 = Dkv<true, 128, 8, 16>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192 = Dkv<false, 192, 12, 24>;
-#[allow(non_camel_case_types)]
 pub type dkv_d192_bf16 = Dkv<true, 192, 12, 24>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256 = Dkv<false, 256, 16, 32>;
-#[allow(non_camel_case_types)]
 pub type dkv_d256_bf16 = Dkv<true, 256, 16, 32>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial = Dkv<false, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_bf16 = Dkv<true, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_no_dropout = Dkv<false, 128, 8, 16, true, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_no_dropout_bf16 = Dkv<true, 128, 8, 16, true, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_plain = Dkv<false, 128, 8, 16, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_plain_bf16 = Dkv<true, 128, 8, 16, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_plain = Dkv<false, 128, 8, 16, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_plain_bf16 = Dkv<true, 128, 8, 16, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_no_dropout = Dkv<false, 128, 8, 16, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_no_dropout_bf16 = Dkv<true, 128, 8, 16, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both = Dkv<false, 128, 8, 16, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_bf16 = Dkv<true, 128, 8, 16, false, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both = Dkv<false, 128, 8, 16, true, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_bf16 = Dkv<true, 128, 8, 16, true, false, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_drop = Dkv<false, 128, 8, 16, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_drop_bf16 = Dkv<true, 128, 8, 16, false, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_drop = Dkv<false, 128, 8, 16, true, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_drop_bf16 = Dkv<true, 128, 8, 16, true, true, true, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked = Dkv<false, 128, 8, 16, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked_bf16 = Dkv<true, 128, 8, 16, false, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked_drop = Dkv<false, 128, 8, 16, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_both_masked_drop_bf16 = Dkv<true, 128, 8, 16, false, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked = Dkv<false, 128, 8, 16, true, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked_bf16 = Dkv<true, 128, 8, 16, true, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked_drop = Dkv<false, 128, 8, 16, true, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dkv_d128_partial_both_masked_drop_bf16 = Dkv<true, 128, 8, 16, true, true, false, true>;
 #[kernel(
     dkv_d128_both_masked,

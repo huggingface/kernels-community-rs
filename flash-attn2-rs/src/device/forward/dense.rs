@@ -60,6 +60,7 @@ pub struct Flash<
     const RECURRENT_COPY: bool = false,
     const RAW_SCORES: bool = false,
     const DROPOUT: bool = false,
+    const Q_SMEM: bool = false,
 >;
 
 impl<
@@ -85,6 +86,7 @@ impl<
     const RECURRENT_COPY: bool,
     const RAW_SCORES: bool,
     const DROPOUT: bool,
+    const Q_SMEM: bool,
 > FlashSpec
     for Flash<
         BF16,
@@ -109,6 +111,7 @@ impl<
         RECURRENT_COPY,
         RAW_SCORES,
         DROPOUT,
+        Q_SMEM,
     >
 {
     #[inline(always)]
@@ -170,6 +173,7 @@ impl<
                 RECURRENT_COPY,
                 RAW_SCORES,
                 DROPOUT,
+                Q_SMEM,
             >(
                 q,
                 k,
@@ -178,16 +182,32 @@ impl<
                 lse,
                 alibi,
                 scale,
-                tanh_scale,
-                window_left,
-                window_right,
+                if RAW_SCORES && HD == 64 {
+                    0.0
+                } else {
+                    tanh_scale
+                },
+                if RAW_SCORES && HD == 64 {
+                    -1
+                } else {
+                    window_left
+                },
+                if RAW_SCORES && HD == 64 {
+                    -1
+                } else {
+                    window_right
+                },
                 seqlen_q,
                 seqlen_k,
-                has_alibi,
-                alibi_causal,
+                if RAW_SCORES && HD == 64 { 0 } else { has_alibi },
+                if RAW_SCORES && HD == 64 {
+                    0
+                } else {
+                    alibi_causal
+                },
                 h,
                 gqa,
-                hs_u32,
+                if RAW_SCORES && HD == 64 { 32 } else { hs_u32 },
                 q_bs,
                 q_ss,
                 q_hs,
@@ -204,27 +224,114 @@ impl<
     }
 }
 
-#[allow(non_camel_case_types)]
 pub type d32_q128 = Flash<false, 32, 2, 4, 128, 64, 2, 128, 8, 4, 4, 16, 8, 4>;
-#[allow(non_camel_case_types)]
 pub type d32_q128_bf16 = Flash<true, 32, 2, 4, 128, 64, 2, 128, 8, 4, 4, 16, 8, 4>;
-#[allow(non_camel_case_types)]
+// Masked d32 (causal/local) runs 128-key tiles: half the barriers per key.
+pub type d32_wide = Flash<false, 32, 2, 4, 64, 128, 1, 128, 16, 8, 2, 16, 4, 2>;
+pub type d32_wide_bf16 = Flash<true, 32, 2, 4, 64, 128, 1, 128, 16, 8, 2, 16, 4, 2>;
+// Unmasked exact d32 on the default tile with the exponent-fused scale.
+pub type d32_raw64 = Flash<
+    false,
+    32,
+    2,
+    4,
+    64,
+    64,
+    1,
+    128,
+    8,
+    4,
+    2,
+    8,
+    4,
+    2,
+    0,
+    false,
+    false,
+    false,
+    true,
+    false,
+    true,
+>;
+pub type d32_raw64_bf16 = Flash<
+    true,
+    32,
+    2,
+    4,
+    64,
+    64,
+    1,
+    128,
+    8,
+    4,
+    2,
+    8,
+    4,
+    2,
+    0,
+    false,
+    false,
+    false,
+    true,
+    false,
+    true,
+>;
 pub type d32 = Flash<false, 32, 2, 4, 64, 64, 1, 128, 8, 4, 2, 8, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type d32_bf16 = Flash<true, 32, 2, 4, 64, 64, 1, 128, 8, 4, 2, 8, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type d64 = Flash<false, 64, 4, 8, 64, 64, 1, 128, 8, 4, 4, 8, 8, 2>;
-#[allow(non_camel_case_types)]
 pub type d64_bf16 = Flash<true, 64, 4, 8, 64, 64, 1, 128, 8, 4, 4, 8, 8, 2>;
-#[allow(non_camel_case_types)]
-pub type d96 = Flash<false, 96, 6, 12, 64, 64, 1, 128, 8, 4, 6, 8, 12, 2>;
-#[allow(non_camel_case_types)]
-pub type d96_bf16 = Flash<true, 96, 6, 12, 64, 64, 1, 128, 8, 4, 6, 8, 12, 2>;
-#[allow(non_camel_case_types)]
+// Unmasked D64 variants keep scores unscaled until the softmax exponent.
+pub type d64_q128_k32_raw = Flash<
+    false,
+    64,
+    4,
+    8,
+    128,
+    32,
+    2,
+    128,
+    4,
+    2,
+    8,
+    8,
+    16,
+    4,
+    GRID_PLAIN,
+    false,
+    false,
+    false,
+    true,
+    false,
+    true,
+>;
+pub type d64_q128_k32_raw_bf16 = Flash<
+    true,
+    64,
+    4,
+    8,
+    128,
+    32,
+    2,
+    128,
+    4,
+    2,
+    8,
+    8,
+    16,
+    4,
+    GRID_PLAIN,
+    false,
+    false,
+    false,
+    true,
+    false,
+    true,
+>;
+// d96 copies use constant per-thread indices: 12-23% faster on Ada.
+pub type d96 = Flash<false, 96, 6, 12, 64, 64, 1, 128, 8, 4, 6, 8, 12, 2, 0, false, true>;
+pub type d96_bf16 = Flash<true, 96, 6, 12, 64, 64, 1, 128, 8, 4, 6, 8, 12, 2, 0, false, true>;
 pub type d128 = Flash<false, 128, 8, 16, 64, 32, 1, 128, 4, 2, 8, 4, 16, 2>;
-#[allow(non_camel_case_types)]
 pub type d128_bf16 = Flash<true, 128, 8, 16, 64, 32, 1, 128, 4, 2, 8, 4, 16, 2>;
-#[allow(non_camel_case_types)]
 pub type d192_short = Flash<
     false,
     192,
@@ -314,49 +421,31 @@ pub type d192_short_causal_bf16 = Flash<
     true,
 >;
 pub type d192 = Flash<false, 192, 12, 24, 64, 48, 1, 128, 6, 3, 12, 6, 24, 2, GRID_PLAIN>;
-#[allow(non_camel_case_types)]
 pub type d192_bf16 = Flash<true, 192, 12, 24, 64, 48, 1, 128, 6, 3, 12, 6, 24, 2, GRID_PLAIN>;
-#[allow(non_camel_case_types)]
 pub type d256 = Flash<false, 256, 16, 32, 128, 32, 1, 256, 4, 2, 16, 4, 32, 2>;
-#[allow(non_camel_case_types)]
 pub type d256_bf16 = Flash<true, 256, 16, 32, 128, 32, 1, 256, 4, 2, 16, 4, 32, 2>;
-#[allow(non_camel_case_types)]
-pub type d96_k32 = Flash<false, 96, 6, 12, 128, 32, 2, 128, 4, 2, 12, 8, 24, 4>;
-#[allow(non_camel_case_types)]
-pub type d96_k32_bf16 = Flash<true, 96, 6, 12, 128, 32, 2, 128, 4, 2, 12, 8, 24, 4>;
-#[allow(non_camel_case_types)]
+pub type d96_k32 = Flash<false, 96, 6, 12, 128, 32, 2, 128, 4, 2, 12, 8, 24, 4, 0, false, true>;
+pub type d96_k32_bf16 = Flash<true, 96, 6, 12, 128, 32, 2, 128, 4, 2, 12, 8, 24, 4, 0, false, true>;
 pub type d128_k32 = Flash<false, 128, 8, 16, 128, 32, 2, 128, 4, 2, 16, 8, 32, 4>;
-#[allow(non_camel_case_types)]
 pub type d128_k32_bf16 = Flash<true, 128, 8, 16, 128, 32, 2, 128, 4, 2, 16, 8, 32, 4>;
-#[allow(non_camel_case_types)]
 pub type d192_k32 = Flash<false, 192, 12, 24, 64, 48, 1, 128, 6, 3, 12, 6, 24, 2, GRID_CAUSAL>;
-#[allow(non_camel_case_types)]
 pub type d192_k32_bf16 = Flash<true, 192, 12, 24, 64, 48, 1, 128, 6, 3, 12, 6, 24, 2, GRID_CAUSAL>;
-#[allow(non_camel_case_types)]
 pub type d256_k32 = Flash<false, 256, 16, 32, 64, 32, 1, 128, 4, 2, 16, 4, 32, 2>;
-#[allow(non_camel_case_types)]
 pub type d256_k32_bf16 = Flash<true, 256, 16, 32, 64, 32, 1, 128, 4, 2, 16, 4, 32, 2>;
 
 // Direct-store variants preserve the original code for local windows.
-#[allow(non_camel_case_types)]
 pub type d64_scalar =
     Flash<false, 64, 4, 8, 64, 64, 1, 128, 8, 4, 4, 8, 8, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d64_bf16_scalar =
     Flash<true, 64, 4, 8, 64, 64, 1, 128, 8, 4, 4, 8, 8, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_scalar =
     Flash<false, 96, 6, 12, 64, 64, 1, 128, 8, 4, 6, 8, 12, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_bf16_scalar =
     Flash<true, 96, 6, 12, 64, 64, 1, 128, 8, 4, 6, 8, 12, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_scalar =
     Flash<false, 128, 8, 16, 64, 32, 1, 128, 4, 2, 8, 4, 16, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_bf16_scalar =
     Flash<true, 128, 8, 16, 64, 32, 1, 128, 4, 2, 8, 4, 16, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_scalar = Flash<
     false,
     192,
@@ -378,7 +467,6 @@ pub type d192_scalar = Flash<
     false,
     false,
 >;
-#[allow(non_camel_case_types)]
 pub type d192_bf16_scalar = Flash<
     true,
     192,
@@ -400,25 +488,18 @@ pub type d192_bf16_scalar = Flash<
     false,
     false,
 >;
-#[allow(non_camel_case_types)]
 pub type d256_scalar =
     Flash<false, 256, 16, 32, 128, 32, 1, 256, 4, 2, 16, 4, 32, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_bf16_scalar =
     Flash<true, 256, 16, 32, 128, 32, 1, 256, 4, 2, 16, 4, 32, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_k32_scalar =
     Flash<false, 96, 6, 12, 128, 32, 2, 128, 4, 2, 12, 8, 24, 4, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d96_k32_bf16_scalar =
     Flash<true, 96, 6, 12, 128, 32, 2, 128, 4, 2, 12, 8, 24, 4, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_k32_scalar =
     Flash<false, 128, 8, 16, 128, 32, 2, 128, 4, 2, 16, 8, 32, 4, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d128_k32_bf16_scalar =
     Flash<true, 128, 8, 16, 128, 32, 2, 128, 4, 2, 16, 8, 32, 4, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d192_k32_scalar = Flash<
     false,
     192,
@@ -440,7 +521,6 @@ pub type d192_k32_scalar = Flash<
     false,
     false,
 >;
-#[allow(non_camel_case_types)]
 pub type d192_k32_bf16_scalar = Flash<
     true,
     192,
@@ -462,10 +542,8 @@ pub type d192_k32_bf16_scalar = Flash<
     false,
     false,
 >;
-#[allow(non_camel_case_types)]
 pub type d256_k32_scalar =
     Flash<false, 256, 16, 32, 64, 32, 1, 128, 4, 2, 16, 4, 32, 2, 0, false, false, false, false>;
-#[allow(non_camel_case_types)]
 pub type d256_k32_bf16_scalar =
     Flash<true, 256, 16, 32, 64, 32, 1, 128, 4, 2, 16, 4, 32, 2, 0, false, false, false, false>;
 
@@ -490,6 +568,10 @@ pub type d256_k32_bf16_scalar =
     d256_k32_bf16_scalar,
     d32,
     d32_bf16,
+    d32_wide,
+    d32_wide_bf16,
+    d32_raw64,
+    d32_raw64_bf16,
     d32_q128,
     d32_raw,
     d32_wide_raw,
@@ -498,6 +580,8 @@ pub type d256_k32_bf16_scalar =
     d32_q128_bf16,
     d64,
     d64_bf16,
+    d64_q128_k32_raw,
+    d64_q128_k32_raw_bf16,
     d96,
     d96_bf16,
     d128,
@@ -506,6 +590,14 @@ pub type d256_k32_bf16_scalar =
     d128_raw_bf16,
     d192_dense,
     d192_dense_bf16,
+    d96_dense,
+    d96_dense_bf16,
+    d32_dense,
+    d32_dense_bf16,
+    d256_dense,
+    d256_dense_bf16,
+    d32_qs_k64,
+    d32_qs_k64_bf16,
     d192,
     d192_bf16,
     d192_short,
@@ -589,120 +681,80 @@ pub fn flash_attn_fwd<S: FlashSpec>(
     }
 }
 
-#[allow(non_camel_case_types)]
 pub type split_d32 = Flash<false, 32, 2, 4, 16, 32, 1, 32, 4, 2, 2, 4, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_bf16 = Flash<true, 32, 2, 4, 16, 32, 1, 32, 4, 2, 2, 4, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64 = Flash<false, 64, 4, 8, 16, 32, 1, 32, 4, 2, 4, 4, 8, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_bf16 = Flash<true, 64, 4, 8, 16, 32, 1, 32, 4, 2, 4, 4, 8, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96 = Flash<false, 96, 6, 12, 16, 32, 1, 32, 4, 2, 6, 4, 12, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_bf16 =
     Flash<true, 96, 6, 12, 16, 32, 1, 32, 4, 2, 6, 4, 12, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128 = Flash<false, 128, 8, 16, 16, 32, 1, 32, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_bf16 =
     Flash<true, 128, 8, 16, 16, 32, 1, 32, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192 =
     Flash<false, 192, 12, 24, 16, 16, 1, 32, 2, 1, 12, 2, 24, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_bf16 =
     Flash<true, 192, 12, 24, 16, 16, 1, 32, 2, 1, 12, 2, 24, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256 =
     Flash<false, 256, 16, 32, 16, 16, 1, 32, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_bf16 =
     Flash<true, 256, 16, 32, 16, 16, 1, 32, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true>;
 
-#[allow(non_camel_case_types)]
 pub type split_fast_d32_q64 =
     Flash<false, 32, 2, 4, 64, 64, 1, 128, 8, 4, 2, 8, 4, 2, GRID_PLAIN, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_fast_d32_q64_bf16 =
     Flash<true, 32, 2, 4, 64, 64, 1, 128, 8, 4, 2, 8, 4, 2, GRID_PLAIN, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_k64_d32_q64 =
     Flash<false, 32, 2, 4, 64, 64, 1, 128, 8, 4, 2, 8, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_k64_d32_q64_bf16 =
     Flash<true, 32, 2, 4, 64, 64, 1, 128, 8, 4, 2, 8, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_k64_d32_q32 =
     Flash<false, 32, 2, 4, 32, 64, 1, 64, 8, 4, 2, 8, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_k64_d32_q32_bf16 =
     Flash<true, 32, 2, 4, 32, 64, 1, 64, 8, 4, 2, 8, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_q32 = Flash<false, 32, 2, 4, 32, 32, 1, 64, 4, 2, 2, 4, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d32_q32_bf16 =
     Flash<true, 32, 2, 4, 32, 32, 1, 64, 4, 2, 2, 4, 4, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_q32 = Flash<false, 64, 4, 8, 32, 32, 1, 64, 4, 2, 4, 4, 8, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d64_q32_bf16 =
     Flash<true, 64, 4, 8, 32, 32, 1, 64, 4, 2, 4, 4, 8, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_q32 =
     Flash<false, 96, 6, 12, 32, 32, 1, 64, 4, 2, 6, 4, 12, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d96_q32_bf16 =
     Flash<true, 96, 6, 12, 32, 32, 1, 64, 4, 2, 6, 4, 12, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_q32 =
     Flash<false, 128, 8, 16, 32, 32, 1, 64, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d128_q32_bf16 =
     Flash<true, 128, 8, 16, 32, 32, 1, 64, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_q32 =
     Flash<false, 192, 12, 24, 32, 16, 1, 64, 2, 1, 12, 2, 24, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_q32_bf16 =
     Flash<true, 192, 12, 24, 32, 16, 1, 64, 2, 1, 12, 2, 24, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_q32 =
     Flash<false, 256, 16, 32, 32, 16, 1, 64, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_q32_bf16 =
     Flash<true, 256, 16, 32, 32, 16, 1, 64, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true>;
 
-#[allow(non_camel_case_types)]
 pub type split_d192_q64 =
     Flash<false, 192, 12, 24, 64, 16, 1, 128, 2, 1, 12, 2, 24, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d192_q64_bf16 =
     Flash<true, 192, 12, 24, 64, 16, 1, 128, 2, 1, 12, 2, 24, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_q64 =
     Flash<false, 256, 16, 32, 64, 16, 1, 128, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_d256_q64_bf16 =
     Flash<true, 256, 16, 32, 64, 16, 1, 128, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true>;
 
-#[allow(non_camel_case_types)]
 pub type split_fast_d128_q16 =
     Flash<false, 128, 8, 16, 16, 32, 1, 32, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_fast_d128_q16_bf16 =
     Flash<true, 128, 8, 16, 16, 32, 1, 32, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_fast_d128_q32 =
     Flash<false, 128, 8, 16, 32, 32, 1, 64, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true, true>;
-#[allow(non_camel_case_types)]
 pub type split_fast_d128_q32_bf16 =
     Flash<true, 128, 8, 16, 32, 32, 1, 64, 4, 2, 8, 4, 16, 2, GRID_PLAIN, true, true>;
 
-#[allow(non_camel_case_types)]
 pub type split_k64_d64_q32 =
     Flash<false, 64, 4, 8, 32, 64, 1, 64, 8, 4, 4, 8, 8, 2, GRID_PLAIN, true>;
-#[allow(non_camel_case_types)]
 pub type split_k64_d64_q32_bf16 =
     Flash<true, 64, 4, 8, 32, 64, 1, 64, 8, 4, 4, 8, 8, 2, GRID_PLAIN, true>;
 
@@ -824,16 +876,12 @@ pub fn flash_attn_split<S: FlashSpec>(
     }
 }
 
-#[allow(non_camel_case_types)]
 pub type reverse_split_d256_q32 =
     Flash<false, 256, 16, 32, 32, 16, 1, 64, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type reverse_split_d256_q32_bf16 =
     Flash<true, 256, 16, 32, 32, 16, 1, 64, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type reverse_split_d256_q64 =
     Flash<false, 256, 16, 32, 64, 16, 1, 128, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type reverse_split_d256_q64_bf16 =
     Flash<true, 256, 16, 32, 64, 16, 1, 128, 2, 1, 16, 2, 32, 2, GRID_PLAIN, true, false, true>;
 
@@ -952,9 +1000,7 @@ pub trait MergeSpec {
 impl<const BF16: bool> MergeSpec for Merge<BF16> {
     const BF16: bool = BF16;
 }
-#[allow(non_camel_case_types)]
 pub type merge_f16 = Merge<false>;
-#[allow(non_camel_case_types)]
 pub type merge_bf16 = Merge<true>;
 
 #[kernel(merge_f16, merge_bf16)]
@@ -1102,7 +1148,9 @@ pub fn flash_attn_merge4<S: MergeSpec>(
         let mut lo = 0.0f32;
         let mut hi = 0.0f32;
         let mut split = 0;
+        // Group loads from independent splits while preserving the sum order.
         while split < splits {
+            thread::__unroll_config::<4>();
             let base = batch * splits + split;
             let weight = *weights.add(split as usize);
             let oi = if groups > 1 {
@@ -1110,8 +1158,16 @@ pub fn flash_attn_merge4<S: MergeSpec>(
             } else {
                 ((base * sq + query) * heads + head) * words + col
             };
-            let a = f32::from_bits(*partial.as_ptr().add((oi * 2) as usize));
-            let b = f32::from_bits(*partial.as_ptr().add((oi * 2 + 1) as usize));
+            // Each packed output word corresponds to an aligned pair of f32s.
+            let a: f32;
+            let b: f32;
+            cuda_device::ptx_asm!(
+                "ld.global.v2.f32 {%0, %1}, [%2];",
+                out("=f") a,
+                out("=f") b,
+                in("l") partial.as_ptr().add((oi * 2) as usize),
+                clobber("memory")
+            );
             lo += weight * a;
             hi += weight * b;
             split += 1;
@@ -1172,7 +1228,6 @@ pub type d128_raw_bf16 = Flash<
     true,
 >;
 
-#[allow(non_camel_case_types)]
 pub type d32_raw = Flash<
     false,
     32,
@@ -1197,7 +1252,6 @@ pub type d32_raw = Flash<
     true,
 >;
 
-#[allow(non_camel_case_types)]
 pub type d32_raw_bf16 = Flash<
     true,
     32,
@@ -1222,7 +1276,6 @@ pub type d32_raw_bf16 = Flash<
     true,
 >;
 
-#[allow(non_camel_case_types)]
 pub type d32_wide_raw = Flash<
     false,
     32,
@@ -1247,7 +1300,6 @@ pub type d32_wide_raw = Flash<
     true,
 >;
 
-#[allow(non_camel_case_types)]
 pub type d32_wide_raw_bf16 = Flash<
     true,
     32,
@@ -1272,8 +1324,63 @@ pub type d32_wide_raw_bf16 = Flash<
     true,
 >;
 
+// Resident-Q tile (v2's Is_Q_in_regs=false): two 16-row fragments per warp
+// without holding Q in registers; unmasked exact d32 only. The same tile
+// for d96 (32/48/64 keys) measured no faster and spilled at 48+ keys.
+macro_rules! qsmem_flash {
+    ($name:ident, $bf16:expr, $hd:expr, $nfq:expr, $nfo:expr, $keys:expr, $nkt:expr, $pv:expr) => {
+        pub type $name = Flash<
+            $bf16,
+            $hd,
+            $nfq,
+            $nfo,
+            128,
+            $keys,
+            2,
+            128,
+            $nkt,
+            $pv,
+            1,
+            { 2 * $nkt },
+            { 2 * $nfo },
+            4,
+            0,
+            false,
+            true,
+            false,
+            true,
+            false,
+            true,
+            false,
+            true,
+        >;
+    };
+}
+qsmem_flash!(d32_qs_k64, false, 32, 2, 4, 64, 8, 4);
+qsmem_flash!(d32_qs_k64_bf16, true, 32, 2, 4, 64, 8, 4);
+
 pub type d192_dense = Flash<false, 192, 12, 24, 128, 64, 1, 256, 8, 4, 12, 8, 24, 2>;
 pub type d192_dense_bf16 = Flash<true, 192, 12, 24, 128, 64, 1, 256, 8, 4, 12, 8, 24, 2>;
+
+// Resident-Q tiles on the reference shapes: D96 128x64 with four warps of
+// 32 rows, D32 128x128 with eight warps of 16 rows, D256 64x64 with four
+// warps of 16 rows. D96 takes the flush-to-zero exponent (mode 7: 1024 keys
+// 45.1 -> 42.7 us); at D32 it costs ten registers, which drops the second
+// block per SM (4096: 221 -> 254 us).
+pub type d96_dense =
+    super::resident::Resident<false, 128, 48, 16, 64, 2, 128, 8, 12, 16, 24, 6, 4, 12, 6, 7>;
+pub type d96_dense_bf16 =
+    super::resident::Resident<true, 128, 48, 16, 64, 2, 128, 8, 12, 16, 24, 6, 4, 12, 6, 7>;
+pub type d32_dense =
+    super::resident::Resident<false, 128, 16, 16, 128, 1, 256, 16, 4, 16, 4, 2, 8, 2, 2, 1>;
+pub type d32_dense_bf16 =
+    super::resident::Resident<true, 128, 16, 16, 128, 1, 256, 16, 4, 16, 4, 2, 8, 2, 2, 1>;
+// D256 streams K/V through 128-byte planes like the reference (64-byte
+// planes: 4096 keys 1794 -> 1732 us).
+pub type d256_dense =
+    super::resident::Resident<false, 64, 128, 32, 64, 1, 128, 8, 32, 8, 32, 16, 4, 16, 16, 7>;
+pub type d256_dense_bf16 =
+    super::resident::Resident<true, 64, 128, 32, 64, 1, 128, 8, 32, 8, 32, 16, 4, 16, 16, 7>;
 
 type DropoutFlash<
     const BF16: bool,
@@ -1308,29 +1415,17 @@ type DropoutFlash<
     true,
 >;
 
-#[allow(non_camel_case_types)]
 pub type dropout_d32 = DropoutFlash<false, 32, 2, 4, 64, 8, 4>;
-#[allow(non_camel_case_types)]
 pub type dropout_d32_bf16 = DropoutFlash<true, 32, 2, 4, 64, 8, 4>;
-#[allow(non_camel_case_types)]
 pub type dropout_d64 = DropoutFlash<false, 64, 4, 8, 64, 8, 4>;
-#[allow(non_camel_case_types)]
 pub type dropout_d64_bf16 = DropoutFlash<true, 64, 4, 8, 64, 8, 4>;
-#[allow(non_camel_case_types)]
 pub type dropout_d96 = DropoutFlash<false, 96, 6, 12, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d96_bf16 = DropoutFlash<true, 96, 6, 12, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d128 = DropoutFlash<false, 128, 8, 16, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d128_bf16 = DropoutFlash<true, 128, 8, 16, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d192 = DropoutFlash<false, 192, 12, 24, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d192_bf16 = DropoutFlash<true, 192, 12, 24, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d256 = DropoutFlash<false, 256, 16, 32, 32, 4, 2>;
-#[allow(non_camel_case_types)]
 pub type dropout_d256_bf16 = DropoutFlash<true, 256, 16, 32, 32, 4, 2>;
 
 #[kernel(

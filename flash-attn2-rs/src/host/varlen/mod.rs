@@ -14,12 +14,14 @@ use crate::host::layout::{
 };
 use crate::host::rng::resolve_rng_descriptor;
 use crate::host::runtime::runtime;
-use crate::host::tiles::{HEAD_DIMS, dropout_tile, flash_smem_bytes};
+use crate::host::tiles::{
+    HEAD_DIMS, dropout_tile, flash_smem_bytes, paged_causal_tile, wide_smem_bytes,
+};
 use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
 // Packed rank-three inputs share stride preparation with dense/cache inputs.
 fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
-    let cached = !descriptor_mode && matches!(args.len(), 22 | 23 | 24);
+    let cached = !descriptor_mode && matches!(args.len(), 22 | 23 | 24 | 26);
     if (descriptor_mode && args.len() != 24)
         || (!descriptor_mode && args.len() != 19 && args.len() != 20 && !cached)
     {
@@ -33,7 +35,7 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
     } else {
         prepare_packed_qkv
     };
-    let (q, bf16, qs) = prepare("q", arg(args, 0, "q")?)?;
+    let (mut q, bf16, mut qs) = prepare("q", arg(args, 0, "q")?)?;
     let (k, kb, ks) = prepare("k", arg(args, 1, "k")?)?;
     let (v, vb, vs) = prepare("v", arg(args, 2, "v")?)?;
     let cuq: Option<Tensor> = arg(args, 3, "cu_seqlens_q")?;
@@ -76,7 +78,7 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
             "num_splits must fit int32 and be at most 128",
         ));
     }
-    let grouped: bool = if cached && args.len() == 24 {
+    let grouped: bool = if cached && args.len() >= 24 {
         arg(args, 23, "grouped_output")?
     } else {
         false
@@ -370,6 +372,74 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
     let split_varlen =
         (packed_decode && (splits > 1 || packed_grouped)) || (packed_multi && splits > 1);
     let partial_output = splits > 1 || grouped || packed_grouped;
+    // Folded kernels: exact head dims only, so hs_u32 is a compile-time constant.
+    let wide_cached = rt.sm89
+        && cached
+        && !partial_output
+        && !paged
+        && d == bucket
+        && score_scale > 0.0
+        && (score_scale * std::f32::consts::LOG2_E).is_finite()
+        && cap <= 0.0
+        && alibi.is_none()
+        && left < 0
+        && right < 0
+        && max_q <= 16
+        && max_k >= 1024
+        && batch * h <= rt.sm_count;
+    let wide_grouped_cached = wide_cached && max_q == 1 && h > hk && h / hk <= 64;
+    // Wider heads measured slower with the folded paged tiles.
+    let paged_causal = rt.sm89
+        && paged
+        && !cached
+        && d == bucket
+        && d <= 64
+        && p == 0.0
+        && cap <= 0.0
+        && alibi.is_none()
+        && k_shape[1] == 256
+        && left >= max_k
+        && right == 0;
+
+    let append = if cached && args.len() == 26 {
+        if !wide_cached
+            || max_q != 1
+            || !(h == hk || wide_grouped_cached)
+            || indices.is_some()
+            || leftpad.is_some()
+            || !(1..=16).contains(&new_keys)
+        {
+            return Err(err(
+                VALUE_ERROR,
+                "fused cache append requires an unsplit plain exact-head-dim single-query tile",
+            ));
+        }
+        let (ak, akb, _) = prepare_qkv("append_k", arg(args, 24, "append_k")?)?;
+        let (av, avb, _) = prepare_qkv("append_v", arg(args, 25, "append_v")?)?;
+        if akb != bf16
+            || avb != bf16
+            || ak.device() != q.device()
+            || av.device() != q.device()
+            || ak.shape() != [batch, new_keys, hk, d]
+            || av.shape() != ak.shape()
+        {
+            return Err(err(
+                VALUE_ERROR,
+                "fused append tensors must match cache heads and dtype",
+            ));
+        }
+        let (saved_q, ak, av) =
+            crate::host::cache::prepare_fused_append(&q, &k, &v, &ak, &av, cuk.as_ref().unwrap())?;
+        let (saved_q, _, saved_qs) = prepare_qkv("q", saved_q)?;
+        q = saved_q;
+        qs = saved_qs;
+        let (ak, _, aks) = prepare_qkv("append_k", ak)?;
+        let (av, _, avs) = prepare_qkv("append_v", av)?;
+        Some((ak, av, aks, avs))
+    } else {
+        None
+    };
+
     if ((max_q + 63) / 64) * splits > i32::MAX as i64
         || (partial_output && total_q * h > i32::MAX as i64)
     {
@@ -555,6 +625,25 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
                 params.push((value as *mut u32).cast());
             }
         }
+        let mut append_buffers = append.as_ref().map_or([0u64; 4], |(ak, av, _, _)| {
+            [
+                ak.data_ptr() as u64,
+                tensor_span(ak),
+                av.data_ptr() as u64,
+                tensor_span(av),
+            ]
+        });
+        let mut append_strides = append.as_ref().map_or([0u32; 6], |(_, _, aks, avs)| {
+            [aks.batch, aks.seq, aks.head, avs.batch, avs.seq, avs.head]
+        });
+        if cached && !partial_output {
+            for value in &mut append_buffers {
+                params.push((value as *mut u64).cast());
+            }
+            for value in &mut append_strides {
+                params.push((value as *mut u32).cast());
+            }
+        }
         let mut split_count = splits as u32;
         if partial_output {
             params.push((&mut split_count as *mut u32).cast());
@@ -571,6 +660,10 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
             rt.varlen_split_fns
                 .get(&(bucket, bf16, paged, packed_grouped))
                 .unwrap()
+        } else if wide_cached {
+            rt.cached_wide_fns
+                .get(&(bucket, bf16, wide_grouped_cached))
+                .unwrap()
         } else if cached {
             (if partial_output {
                 &rt.cached_split_fns
@@ -579,21 +672,47 @@ fn varlen_fwd(args: &[AnyView], descriptor_mode: bool) -> Result<Any> {
             })
             .get(&(bucket, bf16, paged))
             .unwrap()
+        } else if paged_causal {
+            rt.paged_causal256_fns.get(&(bucket, bf16)).unwrap()
         } else {
             (if paged { &rt.paged_fns } else { &rt.varlen_fns })
                 .get(&(bucket, bf16, p as f32 > 0.0))
                 .unwrap()
         };
+        // Matches LaunchTile: longest causal blocks of every head first.
+        let q_blocks = (max_q + 63) / 64;
+        let head_first = !cached
+            && !split_varlen
+            && right == 0
+            && left >= max_k
+            && q_blocks > 1
+            && q_blocks <= 65535;
+        let grid = if head_first {
+            ((batch * h) as u32, q_blocks as u32, 1)
+        } else {
+            (
+                (((work_queries + 63) / 64) * splits) as u32,
+                (if wide_grouped_cached { hk } else { work_heads }) as u32,
+                batch as u32,
+            )
+        };
         unsafe {
             launch_kernel(
                 function.cu_function(),
-                (
-                    (((work_queries + 63) / 64) * splits) as u32,
-                    work_heads as u32,
-                    batch as u32,
-                ),
+                grid,
                 (128, 1, 1),
-                flash_smem_bytes(bucket, dropout_tile(bucket)),
+                if wide_cached {
+                    wide_smem_bytes(bucket)
+                } else {
+                    flash_smem_bytes(
+                        bucket,
+                        if paged_causal {
+                            paged_causal_tile(bucket)
+                        } else {
+                            dropout_tile(bucket)
+                        },
+                    )
+                },
                 stream.cast(),
                 &mut params,
             )

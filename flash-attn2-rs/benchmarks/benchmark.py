@@ -54,8 +54,79 @@ CASES = {
     "forward-d192": ("forward", 2, 1024, 1024, 8, 8, 192, "float16", 0.0, False),
     "cross-d32": ("forward", 1, 64, 2048, 4, 2, 32, "float16", 0.0, True),
     "forward-4096": ("forward", 2, 4096, 4096, 8, 8, 128, "float16", 0.0, True),
+    "decode-bf16": ("decode", 2, 1, 2048, 8, 2, 128, "bfloat16", 0.0, False),
+    "decode-append-bf16": ("decode-append", 2, 1, 2048, 8, 2, 128, "bfloat16", 0.0, False),
+    "packed-backward-plain": ("packed-backward", 2, 1024, 1024, 8, 8, 64, "float16", 0.0, False),
+    "packed-backward-plain-bf16": ("packed-backward", 2, 1024, 1024, 8, 8, 64, "bfloat16", 0.0, False),
+    "packed-backward-plain-4096": ("packed-backward", 2, 4096, 4096, 8, 8, 64, "float16", 0.0, False),
+    "packed-backward-plain-4096-bf16": ("packed-backward", 2, 4096, 4096, 8, 8, 64, "bfloat16", 0.0, False),
 }
 QUICK = list(CASES)[:13]
+FULL = list(CASES)
+REFERENCE_REPO = "kernels-community/flash-attn2"
+REFERENCE_CASES = []
+# Columns use KV sequence length; decode has one query token.
+for length in (1024, 4096):
+    for dtype in ("float16", "bfloat16"):
+        for label, operation, causal, kv_heads in (
+            ("fwd", "forward", False, 8),
+            ("fwd_causal", "forward", True, 8),
+            ("fwd_gqa", "forward", True, 2),
+            ("bwd", "backward", False, 8),
+            ("varlen_fwd", "packed", True, 8),
+            ("varlen_bwd", "packed-backward", True, 8),
+            ("fwd_kvcache", "decode", False, 2),
+            ("paged_fwd", "paged", True, 2),
+        ):
+            name = f"ref-{label}-{dtype}-{length}"
+            CASES[name] = (
+                operation,
+                2,
+                1 if operation == "decode" else length,
+                length,
+                8,
+                kv_heads,
+                64,
+                dtype,
+                0.0,
+                causal,
+            )
+            REFERENCE_CASES.append(name)
+# Frozen parity matrix: every case must be within the regression threshold of
+# the reference. Do not change it while working toward parity. The reference
+# has no D256 dropout backward on sm86/sm89 (99 KB shared memory), so those
+# cases are not comparable and are left out.
+PARITY_CASES = []
+for head_dim in (32, 64, 96, 128, 192, 256):
+    for length in (1024, 4096):
+        for dtype in ("float16", "bfloat16"):
+            for label, operation, causal, kv_heads, dropout in (
+                ("fwd", "forward", False, 8, 0.0),
+                ("fwd_causal", "forward", True, 8, 0.0),
+                ("fwd_gqa", "forward", True, 2, 0.0),
+                ("bwd", "backward", False, 8, 0.0),
+                ("bwd_dropout", "backward", True, 8, 0.17),
+                ("varlen_fwd", "packed", True, 8, 0.0),
+                ("varlen_bwd", "packed-backward", True, 8, 0.0),
+                ("kvcache_append", "decode-append", False, 2, 0.0),
+                ("paged_fwd", "paged", True, 2, 0.0),
+            ):
+                if head_dim == 256 and label == "bwd_dropout":
+                    continue
+                name = f"parity-d{head_dim}-{label}-{dtype}-{length}"
+                CASES[name] = (
+                    operation,
+                    2,
+                    1 if operation == "decode-append" else length,
+                    length,
+                    8,
+                    kv_heads,
+                    head_dim,
+                    dtype,
+                    dropout,
+                    causal,
+                )
+                PARITY_CASES.append(name)
 FIELDS = [
     "operation",
     "batch",
@@ -325,7 +396,7 @@ def worker(args):
     torch.cuda.init()
     start = time.perf_counter()
     # The parent maps REPO_ID to this worker's artifact with LOCAL_KERNELS.
-    module = kernels.get_kernel(REPO_ID, version=1)
+    module = kernels.get_kernel(args.worker_repo, version=args.worker_version)
     load_ms = (time.perf_counter() - start) * 1000
     props = torch.cuda.get_device_properties(args.device)
     context = {}
@@ -505,7 +576,12 @@ class Worker:
         self, args, artifact, python, directory, label, clear_pythonpath=False
     ):
         env = dict(os.environ)
-        env["LOCAL_KERNELS"] = f"{REPO_ID}={Path(artifact).resolve()}"
+        is_reference = (
+            label.startswith("baseline-") and args.reference_version is not None
+        )
+        repo = REFERENCE_REPO if is_reference else REPO_ID
+        version = args.reference_version if is_reference else 1
+        env["LOCAL_KERNELS"] = f"{repo}={Path(artifact).resolve()}"
         if clear_pythonpath:
             env.pop("PYTHONPATH", None)
         if args.cold:
@@ -514,6 +590,10 @@ class Worker:
             python,
             str(Path(__file__).resolve()),
             "--worker",
+            "--worker-repo",
+            repo,
+            "--worker-version",
+            str(version),
             "--device",
             args.device,
             "--mode",
@@ -610,7 +690,34 @@ def run(args):
     import torch
 
     torch.set_num_threads(1)
-    names = args.cases or (list(CASES) if args.suite == "full" else QUICK)
+    names = (
+        args.cases
+        or {"quick": QUICK, "full": FULL, "reference": REFERENCE_CASES, "parity": PARITY_CASES}[
+            args.suite
+        ]
+    )
+    reference = None
+    if args.reference_version is not None:
+        import kernels
+        from huggingface_hub import HfApi
+
+        revision = f"v{args.reference_version}"
+        commit = (
+            HfApi().repo_info(REFERENCE_REPO, repo_type="kernel", revision=revision).sha
+        )
+        module = kernels.get_kernel(REFERENCE_REPO, revision=commit)
+        # Use the downloaded build bundle in isolated workers, with its bytes hashed.
+        bundle = Path(module.__file__).parent.parent
+        if commit not in bundle.parts:
+            raise ValueError(
+                "reference resolved to a local override, not the requested Hub commit"
+            )
+        args.baseline = bundle
+        reference = {
+            "repo_id": REFERENCE_REPO,
+            "version": args.reference_version,
+            "commit": commit,
+        }
     unknown = set(names) - CASES.keys()
     if unknown:
         raise ValueError(f"unknown cases: {sorted(unknown)}; use --list")
@@ -629,6 +736,7 @@ def run(args):
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "artifacts": {"baseline": artifacts[0], "candidate": artifacts[1]},
         "aa": identical,
+        "reference": reference,
         "runner_sha256": digest_file(Path(__file__)),
         "settings": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
@@ -845,6 +953,12 @@ def run(args):
         status: statuses.count(status) for status in sorted(set(statuses))
     }
     save()
+    if args.markdown is not None:
+        from reference_table import render
+
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(render(report))
+        print(f"Markdown: {args.markdown}")
     print(f"Results: {args.output}\n{report['summary']}")
     if args.fail_on_regression and any(
         x in statuses
@@ -859,6 +973,16 @@ def main():
     )
     parser.add_argument("--candidate", type=Path, default=Path("result"))
     parser.add_argument("--baseline", type=Path)
+    parser.add_argument(
+        "--reference-version",
+        type=int,
+        help="compare against kernels-community/flash-attn2 at this required version",
+    )
+    parser.add_argument(
+        "--markdown",
+        type=Path,
+        help="write the reference matrix as Markdown (graph mode required)",
+    )
     parser.add_argument(
         "--baseline-python",
         default=None,
@@ -877,7 +1001,9 @@ def main():
     )
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--cases", nargs="+")
-    parser.add_argument("--suite", choices=("quick", "full"), default="quick")
+    parser.add_argument(
+        "--suite", choices=("quick", "full", "reference", "parity"), default="quick"
+    )
     parser.add_argument("--mode", choices=("eager", "graph", "both"), default="both")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=948)
@@ -915,7 +1041,13 @@ def main():
     )
     parser.add_argument("--fail-on-regression", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-repo", default=REPO_ID, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-version", type=int, default=1, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.reference_version is not None and args.baseline is not None:
+        parser.error("choose --baseline or --reference-version")
+    if args.markdown and (args.mode == "eager" or args.suite != "reference"):
+        parser.error("--markdown requires --suite reference and graph timing")
     if args.list:
         for name, case in CASES.items():
             print(name, json.dumps(dict(zip(FIELDS, case))))
@@ -940,7 +1072,9 @@ def main():
         parser.error("warmup-ms must be finite and nonnegative")
     if args.worker:
         worker(args)
-    elif args.baseline is None or args.output is None:
+    elif (
+        args.baseline is None and args.reference_version is None
+    ) or args.output is None:
         parser.error("comparison requires --baseline and --output; use --freeze first")
     else:
         run(args)

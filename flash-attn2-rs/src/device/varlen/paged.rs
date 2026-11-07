@@ -22,11 +22,28 @@ impl Pages {
     };
 }
 
+// Page-table entry for the tile at `base`, or -1 past the table row.
+// Loaded one tile ahead so the global latency hides behind a tile of MMAs.
+#[inline(always)]
+pub unsafe fn lookup_page(pages: Pages, batch: u32, base: u32) -> i32 {
+    unsafe {
+        let logical_page = base / pages.size;
+        if logical_page < pages.columns {
+            *pages
+                .table
+                .add(batch as usize * pages.row_stride as usize + logical_page as usize)
+        } else {
+            -1
+        }
+    }
+}
+
 #[inline(always)]
 pub unsafe fn stage_tile<const HD: usize, const KEYS: u32, const THREADS: u32>(
     smem: *mut u32,
     src: *const u32,
     base: u32,
+    page: i32,
     head_base: usize,
     seq_stride: u32,
     page_stride: u32,
@@ -36,14 +53,6 @@ pub unsafe fn stage_tile<const HD: usize, const KEYS: u32, const THREADS: u32>(
     pages: Pages,
 ) {
     unsafe {
-        let logical_page = base / pages.size;
-        let page = if logical_page < pages.columns {
-            *pages
-                .table
-                .add(tile.b as usize * pages.row_stride as usize + logical_page as usize)
-        } else {
-            -1
-        };
         let valid_page = page >= 0 && (page as u32) < pages.count;
         let page_base = if valid_page {
             page as usize * page_stride as usize + head_base
@@ -51,10 +60,16 @@ pub unsafe fn stage_tile<const HD: usize, const KEYS: u32, const THREADS: u32>(
             0
         };
         let within = base % pages.size;
-        let mut i = tile.tid as usize * 4;
-        while i < KEYS as usize * layout.d_u32 {
-            let row = i / layout.d_u32;
-            let col = i % layout.d_u32;
+        let copies = (KEYS as usize * (HD / 2)) / (THREADS as usize * 4);
+        // Constant copy indices keep row/col arithmetic out of the loop.
+        let unrolled = copies * THREADS as usize * 4 == KEYS as usize * (HD / 2);
+        let mut copy = 0usize;
+        while copy < copies || (!unrolled && copy * THREADS as usize * 4 < KEYS as usize * (HD / 2))
+        {
+            thread::__unroll_config::<0>();
+            let i = tile.tid as usize * 4 + copy * THREADS as usize * 4;
+            let row = i / (HD / 2);
+            let col = i % (HD / 2);
             let valid = valid_page
                 && base as usize + row < cfg.seqlen_k as usize
                 && col < cfg.hs_u32 as usize;
@@ -68,7 +83,7 @@ pub unsafe fn stage_tile<const HD: usize, const KEYS: u32, const THREADS: u32>(
                 src.add(offset) as *const u8,
                 if valid { 16 } else { 0 },
             );
-            i += THREADS as usize * 4;
+            copy += 1;
         }
     }
 }
@@ -86,6 +101,7 @@ unsafe fn stage_kv_pair<
     k: *const u32,
     v: *const u32,
     base: u32,
+    page: i32,
     cfg: &FwdConfig,
     tile: &LaunchTile,
     bases: &TensorBases,
@@ -97,6 +113,7 @@ unsafe fn stage_kv_pair<
             k_smem,
             k,
             base,
+            page,
             bases.k,
             cfg.k.seq,
             cfg.k.batch,
@@ -109,6 +126,7 @@ unsafe fn stage_kv_pair<
             v_smem,
             v,
             base,
+            page,
             bases.v,
             cfg.v.seq,
             cfg.v.batch,
@@ -120,6 +138,7 @@ unsafe fn stage_kv_pair<
     }
 }
 
+// `page` belongs to the first staged tile (forward or reverse order).
 #[inline(always)]
 pub unsafe fn prefetch_first_kv<
     const HD: usize,
@@ -138,6 +157,7 @@ pub unsafe fn prefetch_first_kv<
     layout: SmemLayout,
     reverse: bool,
     pages: Pages,
+    page: i32,
 ) {
     unsafe {
         if !layout.double && range.start_tile < range.num_tiles {
@@ -149,6 +169,7 @@ pub unsafe fn prefetch_first_kv<
                 } else {
                     range.start_tile
                 }) * KEYS,
+                page,
                 bases.k,
                 cfg.k.seq,
                 cfg.k.batch,
@@ -170,6 +191,7 @@ pub unsafe fn prefetch_first_kv<
                 } else {
                     range.start_tile
                 }) * KEYS,
+                page,
                 cfg,
                 tile,
                 bases,
@@ -181,6 +203,7 @@ pub unsafe fn prefetch_first_kv<
     }
 }
 
+// `page` is tile j's table entry and `next_page` the following tile's.
 #[inline(always)]
 pub unsafe fn stage_kv_tile<
     const HD: usize,
@@ -200,6 +223,8 @@ pub unsafe fn stage_kv_tile<
     j: u32,
     reverse: bool,
     pages: Pages,
+    page: i32,
+    next_page: i32,
 ) -> (*const u32, *const u32) {
     unsafe {
         let kv_base = j * KEYS;
@@ -218,6 +243,7 @@ pub unsafe fn stage_kv_tile<
                 smem.v0,
                 v,
                 kv_base,
+                page,
                 bases.v,
                 cfg.v.seq,
                 cfg.v.batch,
@@ -238,6 +264,7 @@ pub unsafe fn stage_kv_tile<
                     next_k,
                     k,
                     next_base,
+                    next_page,
                     bases.k,
                     cfg.k.seq,
                     cfg.k.batch,
@@ -266,7 +293,7 @@ pub unsafe fn stage_kv_tile<
                 let nxt_k = if odd { smem.k0 } else { smem.k1 };
                 let nxt_v = if odd { smem.v0 } else { smem.v1 };
                 stage_kv_pair::<HD, KEYS, THREADS, UNROLL_COPY, RECURRENT_COPY>(
-                    nxt_k, nxt_v, k, v, next_base, cfg, tile, bases, layout, pages,
+                    nxt_k, nxt_v, k, v, next_base, next_page, cfg, tile, bases, layout, pages,
                 );
                 ptx_asm!("cp.async.commit_group;", clobber("memory"));
                 ptx_asm!("cp.async.wait_group 1;", clobber("memory"));
@@ -284,6 +311,7 @@ pub unsafe fn stage_kv_tile<
                 smem.v0,
                 v,
                 kv_base,
+                page,
                 bases.v,
                 cfg.v.seq,
                 cfg.v.batch,

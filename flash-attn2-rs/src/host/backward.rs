@@ -6,12 +6,15 @@ use tvm_ffi_sys::TVMFFIEnvGetStream;
 use tvm_ffi_sys::dlpack::{DLDataType, DLDataTypeCode, DLDeviceType};
 
 use crate::host::cuda::{launch_kernel, sys};
-use crate::host::layout::{prepare_qkv, tensor_span};
-use crate::host::runtime::runtime;
+use crate::host::layout::{Strides, prepare_qkv, tensor_span};
+use crate::host::runtime::{Runtime, WIDE_D32, WIDE_MODE, generic_smem, generic_tile, runtime};
 use crate::host::tiles::{HEAD_DIMS, combined_smem};
 use crate::host::{EMPTY_SLICE, MAX_GRID_YZ, alloc_tensor, any_into_raw_owned, arg, err};
 
-fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tensor>> {
+/// With `pre`, argument 5 is the forward output instead of delta: delta is
+/// computed here, clearing the fused dQ accumulator in the same launch, and
+/// appended to the outputs.
+fn backward_component(args: &[AnyView], kv: bool, all: bool, pre: bool) -> Result<Vec<Tensor>> {
     if args.len() != 14 {
         return Err(err(
             VALUE_ERROR,
@@ -23,7 +26,23 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
     let (v, vb, vs) = prepare_qkv("v", arg(args, 2, "v")?)?;
     let (dout, db, ds) = prepare_qkv("dout", arg(args, 3, "dout")?)?;
     let lse: Tensor = arg(args, 4, "lse")?;
-    let delta: Tensor = arg(args, 5, "delta")?;
+    let pre_out = if pre {
+        Some(prepare_qkv("out", arg(args, 5, "out")?)?)
+    } else {
+        None
+    };
+    let delta: Tensor = if let Some((out, _, _)) = &pre_out {
+        let [b, sq, h, _] = *out.shape() else {
+            unreachable!()
+        };
+        alloc_tensor(
+            &[b, h, (sq + 127) / 128 * 128],
+            DLDataType::new(DLDataTypeCode::kDLFloat, 32, 1),
+            out.device(),
+        )?
+    } else {
+        arg(args, 5, "delta")?
+    };
     let alibi: Option<Tensor> = arg(args, 6, "alibi")?;
     let scale: Option<f64> = arg(args, 7, "scale")?;
     let causal: bool = arg(args, 8, "causal")?;
@@ -168,27 +187,67 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
             .and_then(|n| n.checked_mul(8));
         let key_blocks = b * h * ((sk + 63) / 64);
         // Tiny query tiles benefit from fewer launches on underfilled grids.
-        let short_query = sq <= if d == 64 { 128 } else { 32 };
+        let short_query = sq <= if d <= 64 { 128 } else { 32 };
         let enough_parallelism = (short_query || key_blocks >= rt.sm_count / 2)
-            && (sq <= sk || key_blocks >= rt.sm_count);
-        // Measured dense range only.
+            && (d == 32 || sq <= sk || key_blocks >= rt.sm_count);
+        let max_fused_seq = 4096;
+        // The FP32 dQ accumulator and GQA partials must fit in L2, or their
+        // atomics thrash; wide heads have enough compute per tile to hide that.
+        let wide = matches!(d, 192 | 256);
         rt.sm89
-            && matches!(d, 64 | 128)
+            && (matches!(d, 32 | 64 | 96 | 128) || wide)
             && enough_parallelism
             && cap <= 0.0
-            && (32..=1024).contains(&sq)
-            && (128..=1024).contains(&sk)
+            && (32..=max_fused_seq).contains(&sq)
+            && (128..=max_fused_seq).contains(&sk)
             && ((left < 0 && right < 0)
                 || (alibi.is_none() && left >= sk && right == 0)
                 || left + right + 1 >= 256)
-            && q_bytes.is_some_and(|n| n <= (rt.l2_bytes / 2).max(0) as usize)
-            && (h == hk || kv_bytes.is_some_and(|n| n <= rt.l2_bytes / 2))
+            && (wide
+                || (q_bytes.is_some_and(|n| n <= (rt.l2_bytes / 2).max(0) as usize)
+                    && (h == hk || kv_bytes.is_some_and(|n| n <= rt.l2_bytes / 2))))
     } else {
         false
     };
+    // Matches the kernel's plain mode: no dropout, mask or bias.
+    let generic_plain = fused && p == 0.0 && alibi.is_none() && left < 0 && right < 0;
+    let wide = generic_plain && d == 32 && sq <= 1024 && sk <= 1024;
+    let layout = if wide {
+        WIDE_D32
+    } else {
+        generic_tile(d, p > 0.0, generic_plain, false)
+    };
+    // The preprocess launch below needs dout/out to match q's layout.
+    let preprocess = |accum: Option<(&Tensor, i64)>| -> Result<()> {
+        let (out, out_bf16, os) = pre_out.as_ref().unwrap();
+        if out.shape() != q.shape() || *out_bf16 != bf16 || out.device() != device {
+            return Err(err(
+                VALUE_ERROR,
+                "out must match q's shape, dtype and device",
+            ));
+        }
+        if sq == 0 {
+            return Ok(());
+        }
+        let rt = runtime(device.device_id)?;
+        rt.ctx
+            .bind_to_thread()
+            .map_err(|e| err(RUNTIME_ERROR, &format!("bind backward context: {e:?}")))?;
+        let stream = unsafe { TVMFFIEnvGetStream(DLDeviceType::kDLCUDA as i32, device.device_id) };
+        launch_preprocess(rt, stream.cast(), &dout, ds, out, *os, &delta, p, accum)
+    };
     if all && !fused {
-        let mut gradients = backward_component(args, false, false)?;
-        gradients.extend(backward_component(args, true, false)?);
+        if pre {
+            preprocess(None)?;
+            let mut forwarded: Vec<AnyView> = args.to_vec();
+            forwarded[5] = AnyView::from(&delta);
+            let mut gradients = backward_component(&forwarded, false, false, false)?;
+            gradients.extend(backward_component(&forwarded, true, false, false)?);
+            gradients.push(delta);
+            return Ok(gradients);
+        }
+        let mut gradients = backward_component(args, false, false, false)?;
+        gradients.extend(backward_component(args, true, false, false)?);
         return Ok(gradients);
     }
     let fused_q = if fused {
@@ -210,6 +269,9 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
         outputs.push(dq.clone());
         if let Some(dv) = &dv {
             outputs.push(dv.clone());
+        }
+        if pre {
+            outputs.push(delta.clone());
         }
         Ok(outputs)
     };
@@ -328,15 +390,25 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
         }
     }
     let q_partials = if fused || q_splits > 1 {
+        // The generic kernel's permuted reductions cover whole 128-row tiles.
         Some(alloc_tensor(
-            &[q_splits as i64, b, sq, h, d],
+            &[
+                q_splits as i64,
+                b,
+                if fused { (sq + 127) / 128 * 128 } else { sq },
+                h,
+                d,
+            ],
             float32,
             device,
         )?)
     } else {
         None
     };
-    if fused {
+    if fused && pre {
+        let partial = q_partials.as_ref().unwrap();
+        preprocess(Some((partial, partial.shape()[2])))?;
+    } else if fused {
         let partial = q_partials.as_ref().unwrap();
         unsafe {
             sys::cuMemsetD8Async(
@@ -417,24 +489,17 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
         launch_kernel(
             if fused {
                 // Normalized causal left=Sk never excludes a valid key.
-                let mode = if alibi.is_none() && left < 0 && right < 0 {
+                let mode = if wide {
+                    WIDE_MODE
+                } else if alibi.is_none() && left < 0 && right < 0 {
                     0
                 } else if alibi.is_none() && left >= sk && right == 0 {
-                    // Opposite key order helps two batches, one key CTA per SM.
-                    if b == 2 && sq == sk && sq >= 256 && h * ((sk + 63) / 64) == rt.sm_count {
-                        3
-                    } else {
-                        1
-                    }
+                    1
                 } else {
                     2
                 };
-                let kernels = if d == 64 {
-                    &rt.bwd_fused_d64_fns
-                } else {
-                    &rt.bwd_fused_fns
-                };
-                kernels.get(&(bf16, parallel_gqa, p as f32 > 0.0, mode))
+                rt.bwd_generic_fns
+                    .get(&(d, bf16, h > hk, p as f32 > 0.0, mode))
             } else if both_kv {
                 rt.bwd_dkv_both_fns
                     .get(&(bf16, parallel_gqa, p as f32 > 0.0, both_masked))
@@ -464,7 +529,9 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
             .cu_function(),
             if kv {
                 (
-                    (if fused || both_kv {
+                    (if fused {
+                        (sk + layout.keys - 1) / layout.keys
+                    } else if both_kv {
                         (sk + 63) / 64
                     } else {
                         (sk + 31) / 32
@@ -475,9 +542,9 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
             } else {
                 (((sq + 63) / 64) as u32 * q_splits, h as u32, b as u32)
             },
-            (128, 1, 1),
+            (if fused { layout.warps * 32 } else { 128 }, 1, 1),
             if fused {
-                if d == 64 { 25600 } else { 50176 }
+                generic_smem(d, layout)
             } else if both_kv {
                 combined_smem(p as f32 > 0.0, both_masked)
             } else if swizzled_q {
@@ -523,8 +590,42 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
         }
         .map_err(|e| err(RUNTIME_ERROR, &format!("merge GQA gradients: {e:?}")))?;
     }
+    if fused {
+        let partial = q_partials.as_ref().unwrap();
+        let out_q = fused_q.as_ref().unwrap();
+        let rows = layout.rows;
+        let mut buffers = [
+            partial.data_ptr() as u64,
+            partial.numel() as u64,
+            out_q.data_ptr() as u64,
+            out_q.numel() as u64 / 2,
+        ];
+        let mut params: Vec<*mut c_void> =
+            buffers.iter_mut().map(|x| (x as *mut u64).cast()).collect();
+        let mut shape = [sq as u32, h as u32];
+        params.extend(shape.iter_mut().map(|x| (x as *mut u32).cast()));
+        params.push((&mut gradient_scale as *mut f32).cast());
+        unsafe {
+            launch_kernel(
+                if wide {
+                    rt.bwd_wide_dq_fns.get(&bf16)
+                } else {
+                    rt.bwd_generic_dq_fns
+                        .get(&(d, bf16, p > 0.0, generic_plain))
+                }
+                .unwrap()
+                .cu_function(),
+                (((sq + rows - 1) / rows) as u32, h as u32, b as u32),
+                (layout.warps * 32, 1, 1),
+                (rows * (d + 4) * 4) as u32,
+                stream.cast(),
+                &mut params,
+            )
+        }
+        .map_err(|e| err(RUNTIME_ERROR, &format!("convert fused dQ: {e:?}")))?;
+        return finish();
+    }
     if let Some(partial) = &q_partials {
-        let dq = fused_q.as_ref().unwrap_or(&dq);
         let mut buffers = [
             partial.data_ptr() as u64,
             partial.numel() as u64,
@@ -555,8 +656,8 @@ fn backward_component(args: &[AnyView], kv: bool, all: bool) -> Result<Vec<Tenso
     finish()
 }
 
-fn backward_result(args: &[AnyView], kv: bool, all: bool) -> Result<Any> {
-    let outputs = backward_component(args, kv, all)?;
+fn backward_result(args: &[AnyView], kv: bool, all: bool, pre: bool) -> Result<Any> {
+    let outputs = backward_component(args, kv, all, pre)?;
     if kv {
         let views: Vec<AnyView> = outputs.iter().map(AnyView::from).collect();
         Function::get_global("ffi.Array")?.call_packed(&views)
@@ -573,7 +674,7 @@ pub unsafe extern "C" fn __tvm_ffi_bwd_dq(
     result: *mut tvm_ffi_sys::TVMFFIAny,
 ) -> i32 {
     let packed = unsafe { std::slice::from_raw_parts(args as *const AnyView, num_args as usize) };
-    match backward_result(packed, false, false) {
+    match backward_result(packed, false, false, false) {
         Ok(value) => {
             unsafe { *result = any_into_raw_owned(value) };
             0
@@ -593,7 +694,7 @@ pub unsafe extern "C" fn __tvm_ffi_bwd_dkv(
     result: *mut tvm_ffi_sys::TVMFFIAny,
 ) -> i32 {
     let packed = unsafe { std::slice::from_raw_parts(args as *const AnyView, num_args as usize) };
-    match backward_result(packed, true, false) {
+    match backward_result(packed, true, false, false) {
         Ok(value) => {
             unsafe { *result = any_into_raw_owned(value) };
             0
@@ -613,7 +714,27 @@ pub unsafe extern "C" fn __tvm_ffi_bwd_all(
     result: *mut tvm_ffi_sys::TVMFFIAny,
 ) -> i32 {
     let packed = unsafe { std::slice::from_raw_parts(args as *const AnyView, num_args as usize) };
-    match backward_result(packed, true, true) {
+    match backward_result(packed, true, true, false) {
+        Ok(value) => {
+            unsafe { *result = any_into_raw_owned(value) };
+            0
+        }
+        Err(error) => {
+            Error::set_raised(&error);
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __tvm_ffi_bwd_all_preprocess(
+    _handle: *mut c_void,
+    args: *const tvm_ffi_sys::TVMFFIAny,
+    num_args: i32,
+    result: *mut tvm_ffi_sys::TVMFFIAny,
+) -> i32 {
+    let packed = unsafe { std::slice::from_raw_parts(args as *const AnyView, num_args as usize) };
+    match backward_result(packed, true, true, true) {
         Ok(value) => {
             unsafe { *result = any_into_raw_owned(value) };
             0
@@ -668,6 +789,34 @@ fn bwd_preprocess(args: &[AnyView]) -> Result<Any> {
     if seq == 0 {
         return Ok(Any::from(delta));
     }
+    let rt = runtime(out.device().device_id)?;
+    rt.ctx
+        .bind_to_thread()
+        .map_err(|e| err(RUNTIME_ERROR, &format!("bind backward context: {e:?}")))?;
+    let stream =
+        unsafe { TVMFFIEnvGetStream(DLDeviceType::kDLCUDA as i32, out.device().device_id) };
+    launch_preprocess(rt, stream, &dout, ds, &out, os, &delta, p, None)?;
+    Ok(Any::from(delta))
+}
+
+/// Launch delta = rowsum(dO * O) * keep, optionally clearing a fused dQ
+/// accumulator [b, rows, h, d] in the same kernel.
+fn launch_preprocess(
+    rt: &Runtime,
+    stream: *mut c_void,
+    dout: &Tensor,
+    ds: Strides,
+    out: &Tensor,
+    os: Strides,
+    delta: &Tensor,
+    p: f64,
+    accum: Option<(&Tensor, i64)>,
+) -> Result<()> {
+    let [b, seq, h, d] = *out.shape() else {
+        unreachable!()
+    };
+    let bf16 = out.dtype().bits == 16 && out.dtype().code == DLDataTypeCode::kDLBfloat as u8;
+    let rounded_seq = (seq + 127) / 128 * 128;
     let lanes = if d <= 64 {
         8
     } else if d <= 128 {
@@ -675,23 +824,17 @@ fn bwd_preprocess(args: &[AnyView]) -> Result<Any> {
     } else {
         32
     };
-    let grid = b * h * rounded_seq / (256 / lanes);
+    let grid = rounded_seq / (256 / lanes);
     if grid > i32::MAX as i64 {
         return Err(err(
             VALUE_ERROR,
             "backward grid exceeds CUDA indexing range",
         ));
     }
-    let rt = runtime(out.device().device_id)?;
-    rt.ctx
-        .bind_to_thread()
-        .map_err(|e| err(RUNTIME_ERROR, &format!("bind backward context: {e:?}")))?;
-    let stream =
-        unsafe { TVMFFIEnvGetStream(DLDeviceType::kDLCUDA as i32, out.device().device_id) };
     let mut dp = dout.data_ptr() as u64;
-    let mut dl = tensor_span(&dout) / 2;
+    let mut dl = tensor_span(dout) / 2;
     let mut op = out.data_ptr() as u64;
-    let mut ol = tensor_span(&out) / 2;
+    let mut ol = tensor_span(out) / 2;
     let mut dst = delta.data_ptr() as u64;
     let mut len = delta.numel() as u64;
     let mut dims = [
@@ -719,13 +862,17 @@ fn bwd_preprocess(args: &[AnyView]) -> Result<Any> {
         params.push((d as *mut u32).cast());
     }
     params.push((&mut keep as *mut f32).cast());
+    let mut accum_ptr = accum.map_or(0u64, |(t, _)| t.data_ptr() as u64);
+    let mut accum_rows = accum.map_or(0u32, |(_, rows)| rows as u32);
+    params.push((&mut accum_ptr as *mut u64).cast());
+    params.push((&mut accum_rows as *mut u32).cast());
     unsafe {
         launch_kernel(
             rt.bwd_preprocess_fns
                 .get(&(bf16, lanes as u32))
                 .unwrap()
                 .cu_function(),
-            (grid as u32, 1, 1),
+            (grid as u32, h as u32, b as u32),
             (256, 1, 1),
             0,
             stream.cast(),
@@ -733,7 +880,7 @@ fn bwd_preprocess(args: &[AnyView]) -> Result<Any> {
         )
     }
     .map_err(|e| err(RUNTIME_ERROR, &format!("backward preprocess: {e:?}")))?;
-    Ok(Any::from(delta))
+    Ok(())
 }
 
 #[unsafe(no_mangle)]

@@ -379,61 +379,33 @@ impl<
         }
     }
 }
-#[allow(non_camel_case_types)]
 pub type dq_d32 = Dq<false, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type dq_d32_bf16 = Dq<true, 32, 2, 4>;
-#[allow(non_camel_case_types)]
 pub type dq_d64 = Dq<false, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type dq_d64_bf16 = Dq<true, 64, 4, 8>;
-#[allow(non_camel_case_types)]
 pub type dq_d96 = Dq<false, 96, 6, 12>;
-#[allow(non_camel_case_types)]
 pub type dq_d96_bf16 = Dq<true, 96, 6, 12>;
-#[allow(non_camel_case_types)]
 pub type dq_d128 = Dq<false, 128, 8, 16>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_bf16 = Dq<true, 128, 8, 16>;
-#[allow(non_camel_case_types)]
 pub type dq_d192 = Dq<false, 192, 12, 24>;
-#[allow(non_camel_case_types)]
 pub type dq_d192_bf16 = Dq<true, 192, 12, 24>;
-#[allow(non_camel_case_types)]
 pub type dq_d256 = Dq<false, 256, 16, 32>;
-#[allow(non_camel_case_types)]
 pub type dq_d256_bf16 = Dq<true, 256, 16, 32>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled = Dq<false, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_bf16 = Dq<true, 128, 8, 16, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_nodrop = Dq<false, 128, 8, 16, true, 1, false, false>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_plain = Dq<false, 128, 8, 16, true, 1, false, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_nodrop_bf16 = Dq<true, 128, 8, 16, true, 1, false, false>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_plain_bf16 = Dq<true, 128, 8, 16, true, 1, false, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_nocap = Dq<false, 128, 8, 16, true, 1, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_nodrop_nocap = Dq<false, 128, 8, 16, true, 1, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_nocap_bf16 = Dq<true, 128, 8, 16, true, 1, true, false, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_swizzled_nodrop_nocap_bf16 = Dq<true, 128, 8, 16, true, 1, false, false, true>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split2 = Dq<false, 128, 8, 16, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split2_bf16 = Dq<true, 128, 8, 16, false, 2>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split4 = Dq<false, 128, 8, 16, false, 4>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split4_bf16 = Dq<true, 128, 8, 16, false, 4>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split8 = Dq<false, 128, 8, 16, false, 8>;
-#[allow(non_camel_case_types)]
 pub type dq_d128_split8_bf16 = Dq<true, 128, 8, 16, false, 8>;
 #[kernel(
     dq_d128_swizzled_nocap,
